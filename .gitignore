@@ -2,10 +2,10 @@
 __pycache__/
 .ipynb_checkpoints/
 
-data/
-model/
-output/
-sample_evaluation_data/
+/data/
+/model/
+/output/
+/sample_evaluation_data/
 
 *.zip
 *.pt

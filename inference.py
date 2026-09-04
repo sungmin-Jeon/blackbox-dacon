@@ -43,6 +43,8 @@ def _clip_ids(path: Path, frames: int, slot: int, slots: int):
     capture = cv2.VideoCapture(str(path))
     total = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
     capture.release()
+    if slots == 1:
+        return np.linspace(0, total - 1, frames).round().astype(int)
     center = (slot + 0.5) * total / slots
     start = max(0, min(total - frames, round(center - frames / 2)))
     return np.linspace(start, min(total - 1, start + frames - 1), frames).round().astype(int)
@@ -119,7 +121,8 @@ def predict_stage1(data_dir, model_dir):
     model.to(device).eval()
 
     videos = _video_paths(Path(data_dir) / "videos")
-    slots = 3
+    # Match Baidu training: sample one 16-frame clip uniformly over the video.
+    slots = 1
     dataset = _Stage1Clips(videos, slots, size, frames)
     loader = DataLoader(dataset, batch_size=4, num_workers=4, pin_memory=True)
     scores = [[] for _ in videos]

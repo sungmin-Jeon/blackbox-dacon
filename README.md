@@ -13,8 +13,14 @@ file:
 src/
 ├── common/
 ├── stage1/
-│   ├── model.py
-│   └── train.py
+│   ├── data/          # Baidu Dataset and DataLoader builders
+│   ├── checkpoint.py  # best.pt, last.pt, config, metrics
+│   ├── engine.py      # training and validation loops
+│   ├── experiment.py  # Baidu-only experiment orchestration
+│   ├── metrics.py     # Macro-F1 and class prediction ratios
+│   ├── model.py       # MViTv2-S classifier
+│   ├── optim.py       # optimizer and scheduler builders
+│   └── train.py       # original Stage 1 baseline trainer
 ├── stage2/
 │   ├── model.py
 │   └── train.py
@@ -34,19 +40,30 @@ drive.mount("/content/drive")
 ```
 
 ```python
-%cd "/content/drive/MyDrive/blackbox-dacon"
-!git pull origin main
+%cd "/content"
+!git clone https://github.com/sungmin-Jeon/blackbox-dacon.git
+%cd "/content/blackbox-dacon"
 !pip install -r requirements.txt
 ```
 
-Train one Stage independently:
+Train the Baidu-only Stage 1 experiment. Read data from Colab's local disk and
+write checkpoints and metrics to Google Drive:
 
 ```python
 !python train_stage1.py \
-  --data-dir "/content/drive/MyDrive/blackbox-dacon/data/stage1" \
-  --model-dir "/content/drive/MyDrive/blackbox-dacon/model/stage1" \
-  --epochs 1
+  --data-dir "/content/datasets/baidu_moire" \
+  --model-dir "/content/drive/MyDrive/2026_Dacon/sungmin/stage1/baidu_baseline" \
+  --epochs 10 \
+  --batch-size 2 \
+  --frames 16 \
+  --size 224 \
+  --lr 1e-4
 ```
+
+The run saves `best.pt` by validation Macro-F1, `last.pt`, `metrics.csv`, and
+`config.json`. Use a new `--model-dir` for every experiment.
+
+Train the remaining baseline Stages independently:
 
 ```python
 !python train_stage2.py \

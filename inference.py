@@ -52,33 +52,36 @@ def _clip_ids(path: Path, frames: int, slot: int, slots: int):
 
 def _decode_stage1_clip(path: Path, size: int, frame_ids):
     capture = cv2.VideoCapture(str(path))
-    output = []
     wanted = [int(index) for index in frame_ids]
-    capture.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
-    position = wanted[0]
+    if not wanted:
+        capture.release()
+        raise ValueError(f"no frame ids requested: {path.name}")
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError(f"cannot open video: {path.name}")
 
-    for index in wanted:
-        ok = False
-        bgr = None
-        while position <= index:
+    output = []
+    try:
+        for index in wanted:
+            # Jump to each requested position instead of decoding every frame in
+            # between. This matters especially for long 4K/HEVC videos.
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
             ok, bgr = capture.read()
-            position += 1
-            if not ok:
-                break
-        if not ok or bgr is None:
-            continue
+            if not ok or bgr is None:
+                continue
 
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        height, width = rgb.shape[:2]
-        scale = size / min(height, width)
-        resized_height = max(size, round(height * scale))
-        resized_width = max(size, round(width * scale))
-        rgb = cv2.resize(rgb, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-        top = (resized_height - size) // 2
-        left = (resized_width - size) // 2
-        output.append(rgb[top : top + size, left : left + size])
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            height, width = rgb.shape[:2]
+            scale = size / min(height, width)
+            resized_height = max(size, round(height * scale))
+            resized_width = max(size, round(width * scale))
+            rgb = cv2.resize(rgb, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+            top = (resized_height - size) // 2
+            left = (resized_width - size) // 2
+            output.append(rgb[top : top + size, left : left + size])
+    finally:
+        capture.release()
 
-    capture.release()
     if not output:
         raise ValueError(f"cannot decode video: {path.name}")
     while len(output) < len(wanted):

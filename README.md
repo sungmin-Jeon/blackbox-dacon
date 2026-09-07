@@ -63,6 +63,16 @@ write checkpoints and metrics to Google Drive:
 The run saves `best.pt` by validation Macro-F1, `last.pt`, `metrics.csv`, and
 `config.json`. Use a new `--model-dir` for every experiment.
 
+Evaluate a Stage 1 checkpoint on labeled source and recaptured MP4 files using
+the exact preprocessing implemented by submission inference:
+
+```python
+!python eval_stage1.py \
+  --data-dir "/content/drive/MyDrive/2026_Dacon/data/stage1" \
+  --checkpoint "/path/to/stage1/baidu_baseline_v1/best.pt" \
+  --output "/path/to/stage1/baidu_baseline_v1/custom_eval.csv"
+```
+
 Train the remaining baseline Stages independently:
 
 ```python

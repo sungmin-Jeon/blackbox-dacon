@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -57,9 +58,16 @@ def _video_paths(root: Path) -> list[Path]:
 
 
 def _source_id(path: Path, true_label: int) -> str:
-    if true_label == 0:
-        return path.stem
-    return path.stem.split("_", 1)[0]
+    raw_id = path.stem if true_label == 0 else path.stem.split("_", 1)[0]
+    match = re.fullmatch(r"R(\d+)", raw_id, flags=re.IGNORECASE)
+    if match is None:
+        return raw_id
+    return f"R{int(match.group(1)):03d}"
+
+
+def _capture_environment(path: Path) -> str:
+    parts = path.stem.split("_", 1)
+    return parts[1] if len(parts) == 2 else "UNKNOWN"
 
 
 def build_samples(data_dir: Path) -> list[dict]:
@@ -86,7 +94,7 @@ def build_samples(data_dir: Path) -> list[dict]:
                 "path": path,
                 "source_id": _source_id(path, 1),
                 "true_label": 1,
-                "capture_environment": path.parent.name,
+                "capture_environment": _capture_environment(path),
             }
         )
 

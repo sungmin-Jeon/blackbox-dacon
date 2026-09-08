@@ -1,4 +1,4 @@
-"""Run a reproducible Baidu-only Stage 1 experiment."""
+"""Run reproducible Stage 1 experiments on Baidu or manifest-based videos."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from torch import nn
 
 from src.common.runtime import default_device, set_seed
 from src.stage1.checkpoint import append_metrics, save_checkpoint, save_config
-from src.stage1.data import build_baidu_dataloaders
+from src.stage1.data import build_baidu_dataloaders, build_direct_dataloaders
 from src.stage1.engine import train_one_epoch, validate
 from src.stage1.model import build_stage1_model
 from src.stage1.optim import build_optimizer, build_scheduler
@@ -19,10 +19,30 @@ from src.stage1.optim import build_optimizer, build_scheduler
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--dataset",
+        choices=("baidu", "direct"),
+        default="baidu",
+        help="Input dataset type; the default preserves the original Baidu command",
+    )
+    parser.add_argument(
         "--data-dir",
         type=Path,
-        required=True,
         help="Baidu root containing the official train and val folders",
+    )
+    parser.add_argument(
+        "--split-csv",
+        type=Path,
+        help="Direct-video manifest containing train/val split rows",
+    )
+    parser.add_argument(
+        "--video-root",
+        type=Path,
+        help="Optional local root containing source/ and recaptured/",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="Optional local cache for decoded Direct clips",
     )
     parser.add_argument(
         "--model-dir",
@@ -52,6 +72,18 @@ def parse_args() -> argparse.Namespace:
         "--pretrained",
         action=argparse.BooleanOptionalAction,
         default=True,
+        help="Use torchvision pretrained weights when no init checkpoint is given",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help="Optional Stage 1 best.pt used to initialize fine-tuning",
+    )
+    parser.add_argument(
+        "--balanced-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Balance ORIGINAL/RERECORDED sampling for Direct training",
     )
     parser.add_argument(
         "--amp",
@@ -64,9 +96,72 @@ def parse_args() -> argparse.Namespace:
 
 def _resolved_config(args: argparse.Namespace) -> dict:
     config = vars(args).copy()
-    config["data_dir"] = str(args.data_dir.expanduser().resolve())
-    config["model_dir"] = str(args.model_dir.expanduser().resolve())
+    for name in (
+        "data_dir",
+        "model_dir",
+        "split_csv",
+        "video_root",
+        "cache_dir",
+        "init_checkpoint",
+    ):
+        value = getattr(args, name)
+        config[name] = str(value.expanduser().resolve()) if value is not None else None
     return config
+
+
+def _build_dataloaders(args: argparse.Namespace) -> tuple:
+    if args.dataset == "baidu":
+        if args.data_dir is None:
+            raise ValueError("--data-dir is required when --dataset baidu")
+        return build_baidu_dataloaders(
+            args.data_dir,
+            frames=args.frames,
+            size=args.size,
+            batch_size=args.batch_size,
+            val_batch_size=args.val_batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            expected_source_frames=args.expected_source_frames,
+        )
+
+    if args.split_csv is None:
+        raise ValueError("--split-csv is required when --dataset direct")
+    return build_direct_dataloaders(
+        args.split_csv,
+        video_root=args.video_root,
+        cache_dir=args.cache_dir,
+        frames=args.frames,
+        size=args.size,
+        batch_size=args.batch_size,
+        val_batch_size=args.val_batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        balanced_sampling=args.balanced_sampling,
+    )
+
+
+def _build_model(args: argparse.Namespace) -> tuple[nn.Module, Path | None]:
+    if args.init_checkpoint is None:
+        return build_stage1_model(pretrained=args.pretrained), None
+
+    checkpoint_path = args.init_checkpoint.expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Missing initialization checkpoint: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    for key in ("model", "frames", "size"):
+        if key not in checkpoint:
+            raise KeyError(f"Checkpoint has no {key!r} key: {checkpoint_path}")
+    if int(checkpoint["frames"]) != args.frames:
+        raise ValueError(
+            f"Checkpoint frames={checkpoint['frames']} but --frames={args.frames}"
+        )
+    if int(checkpoint["size"]) != args.size:
+        raise ValueError(f"Checkpoint size={checkpoint['size']} but --size={args.size}")
+
+    model = build_stage1_model(pretrained=False)
+    model.net.load_state_dict(checkpoint["model"], strict=True)
+    return model, checkpoint_path
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -75,7 +170,6 @@ def run(args: argparse.Namespace) -> Path:
     if args.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience cannot be negative")
 
-    data_dir = args.data_dir.expanduser().resolve()
     model_dir = args.model_dir.expanduser().resolve()
     model_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = model_dir / "metrics.csv"
@@ -91,18 +185,10 @@ def run(args: argparse.Namespace) -> Path:
     device = default_device()
     amp_enabled = args.amp and device.type == "cuda"
 
-    train_loader, val_loader = build_baidu_dataloaders(
-        data_dir,
-        frames=args.frames,
-        size=args.size,
-        batch_size=args.batch_size,
-        val_batch_size=args.val_batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        expected_source_frames=args.expected_source_frames,
-    )
+    train_loader, val_loader = _build_dataloaders(args)
 
-    model = build_stage1_model(pretrained=args.pretrained).to(device)
+    model, initialization_checkpoint = _build_model(args)
+    model = model.to(device)
     optimizer = build_optimizer(
         model,
         name=args.optimizer,
@@ -118,11 +204,26 @@ def run(args: argparse.Namespace) -> Path:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     print(f"device: {device}")
-    print(f"data: {data_dir}")
+    print(f"dataset: {args.dataset}")
+    if args.dataset == "baidu":
+        print(f"data: {args.data_dir.expanduser().resolve()}")
+    else:
+        print(f"split CSV: {args.split_csv.expanduser().resolve()}")
+        print(
+            "video root: "
+            f"{args.video_root.expanduser().resolve() if args.video_root else 'CSV paths'}"
+        )
+        print(
+            "clip cache: "
+            f"{args.cache_dir.expanduser().resolve() if args.cache_dir else 'disabled'}"
+        )
     print(f"output: {model_dir}")
     print(f"train samples: {len(train_loader.dataset)}")
     print(f"val samples: {len(val_loader.dataset)}")
-    print(f"pretrained: {args.pretrained}")
+    if initialization_checkpoint is None:
+        print(f"initialization: torchvision pretrained={args.pretrained}")
+    else:
+        print(f"initialization checkpoint: {initialization_checkpoint}")
     print(f"amp: {amp_enabled}")
 
     best_score = float("-inf")

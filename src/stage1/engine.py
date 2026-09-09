@@ -19,6 +19,17 @@ class ValidationResult:
     metrics: ClassificationMetrics
 
 
+def _set_training_mode(model: nn.Module) -> None:
+    """Train unfrozen modules while keeping fully frozen submodules in eval mode."""
+    model.train()
+    for module in model.modules():
+        parameters = tuple(module.parameters(recurse=True))
+        if parameters and not any(
+            parameter.requires_grad for parameter in parameters
+        ):
+            module.eval()
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -30,7 +41,7 @@ def train_one_epoch(
     amp: bool = True,
 ) -> float:
     """Train for one epoch and return sample-weighted mean loss."""
-    model.train()
+    _set_training_mode(model)
     total_loss = 0.0
     total_samples = 0
     amp_enabled = amp and device.type == "cuda"

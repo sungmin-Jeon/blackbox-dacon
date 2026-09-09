@@ -80,6 +80,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional Stage 1 best.pt used to initialize fine-tuning",
     )
     parser.add_argument(
+        "--fine-tune-scope",
+        choices=("full", "head", "last-block"),
+        default="full",
+        help=(
+            "Parameters to update: the full model, only the classification head, "
+            "or the final MViT block plus norm and head"
+        ),
+    )
+    parser.add_argument(
         "--balanced-sampling",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -164,6 +173,38 @@ def _build_model(args: argparse.Namespace) -> tuple[nn.Module, Path | None]:
     return model, checkpoint_path
 
 
+def _configure_fine_tuning(model: nn.Module, scope: str) -> tuple[int, int]:
+    """Select which MViT parameters receive gradients."""
+    if scope == "full":
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+    else:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        modules = [model.net.head]
+        if scope == "last-block":
+            if not model.net.blocks:
+                raise ValueError("MViT has no blocks to fine-tune")
+            modules.extend((model.net.blocks[-1], model.net.norm))
+        elif scope != "head":
+            raise ValueError(f"Unsupported fine-tune scope: {scope}")
+
+        for module in modules:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    if trainable_parameters == 0:
+        raise ValueError(f"Fine-tune scope {scope!r} selected no parameters")
+    return trainable_parameters, total_parameters
+
+
 def run(args: argparse.Namespace) -> Path:
     if args.epochs <= 0:
         raise ValueError("epochs must be greater than zero")
@@ -188,6 +229,10 @@ def run(args: argparse.Namespace) -> Path:
     train_loader, val_loader = _build_dataloaders(args)
 
     model, initialization_checkpoint = _build_model(args)
+    trainable_parameters, total_parameters = _configure_fine_tuning(
+        model,
+        args.fine_tune_scope,
+    )
     model = model.to(device)
     optimizer = build_optimizer(
         model,
@@ -224,6 +269,12 @@ def run(args: argparse.Namespace) -> Path:
         print(f"initialization: torchvision pretrained={args.pretrained}")
     else:
         print(f"initialization checkpoint: {initialization_checkpoint}")
+    print(f"fine-tune scope: {args.fine_tune_scope}")
+    print(
+        "trainable parameters: "
+        f"{trainable_parameters:,}/{total_parameters:,} "
+        f"({trainable_parameters / total_parameters:.2%})"
+    )
     print(f"amp: {amp_enabled}")
 
     best_score = float("-inf")

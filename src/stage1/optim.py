@@ -21,16 +21,24 @@ def build_optimizer(
     if weight_decay < 0:
         raise ValueError("weight_decay cannot be negative")
 
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    if not parameters:
+        raise ValueError("Model has no trainable parameters")
+
     normalized_name = name.lower()
     if normalized_name == "adamw":
         return torch.optim.AdamW(
-            model.parameters(),
+            parameters,
             lr=learning_rate,
             weight_decay=weight_decay,
         )
     if normalized_name == "sgd":
         return torch.optim.SGD(
-            model.parameters(),
+            parameters,
             lr=learning_rate,
             momentum=0.9,
             weight_decay=weight_decay,

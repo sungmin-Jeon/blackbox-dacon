@@ -63,6 +63,10 @@ write checkpoints and metrics to Google Drive:
 The run saves `best.pt` by validation Macro-F1, `last.pt`, `metrics.csv`, and
 `config.json`. Use a new `--model-dir` for every experiment.
 
+When initializing from an existing Stage 1 checkpoint, choose how much of the
+MViT to update with `--fine-tune-scope`: `full` (default), `head`, or
+`last-block` (the final MViT block, final norm, and classification head).
+
 Evaluate a Stage 1 checkpoint on labeled source and recaptured MP4 files using
 the exact preprocessing implemented by submission inference:
 

@@ -67,6 +67,82 @@ When initializing from an existing Stage 1 checkpoint, choose how much of the
 MViT to update with `--fine-tune-scope`: `full` (default), `head`, or
 `last-block` (the final MViT block, final norm, and classification head).
 
+## Direct v0 spatial-selection experiments (Colab)
+
+The model and uniform 16-frame temporal sampling stay unchanged. One crop
+location is used for the whole clip; the output remains `[3, 16, 224, 224]`.
+The following options apply to `--dataset direct`:
+
+| `--spatial-mode` | Behavior |
+| --- | --- |
+| `center` (default) | Original short-side resize, then center crop. Old checkpoints keep this behavior. |
+| `native-center` | Center crop before resizing: a control for native crop scale. |
+| `random` | Uniformly select one native crop from the candidate grid per training draw. Evaluation uses a fixed filename/seed-based selection. |
+| `fft` | Select one native crop with the largest clip-averaged high-frequency power. |
+
+`--crop-size 224` is the native-pixel crop edge, independent of model input
+`--size 224`. `--crop-grid 5` puts up to 5 positions on each axis, spanning the
+frame including its edges. Random and FFT use the **same candidate grid and
+crop size**. Frames smaller than the crop are rejected rather than silently
+changing the scale. FFT ties use the first candidate in row-major order.
+
+The FFT score is an explicit **adaptation**, not an exact implementation of
+[DGOAS (WACV 2025)](https://openaccess.thecvf.com/content/WACV2025/papers/Lee_Domain-Generalized_Object_Anti-Spoofing_Bridging_Gaps_and_Patch_Selection_for_Robust_WACV_2025_paper.pdf):
+convert a patch to luminance in `[0,1]`, subtract its mean, apply a 2D Hann
+window, calculate orthonormal FFT power, and average bins whose radial
+frequency is at least `--fft-min-freq 0.25` cycles/pixel. Sum over decoded
+sampled frames (equivalent ranking to the mean), then select the maximum.
+This is a high-frequency-energy score, **not a replay probability**. It may
+also select textured original scenes. It uses one crop, not the paper's five
+64-pixel patches. RGB crops, not spectra, are passed to MViT.
+
+After transferring the updated repository to Colab, restart the runtime if
+the old functions have already been imported. Mount Drive again as needed.
+Adjust these paths to your existing **v0 split CSV** (with a `split` column),
+not the unsplit `stage1_manifest.csv`:
+
+```python
+%cd /content/blackbox-dacon
+!python train_stage1.py \
+  --dataset direct \
+  --split-csv "/content/drive/MyDrive/2026_Dacon/sungmin/stage1/data/stage1_split.csv" \
+  --video-root "/content/direct_stage1" \
+  --model-dir "/content/drive/MyDrive/2026_Dacon/sungmin/stage1/direct_v0_fft_v1" \
+  --cache-dir "/content/stage1_spatial_cache" \
+  --spatial-mode fft --crop-size 224 --crop-grid 5 \
+  --frames 16 --size 224 --epochs 30 --batch-size 2 \
+  --lr 1e-5 --seed 42 --early-stopping-patience 5
+```
+
+For a random-selection comparison change `--spatial-mode random` and use a
+new `--model-dir`. Keep the source split, initialization and training budget
+fixed. Both commands initialize from torchvision pretrained weights by default.
+FFT decoding makes two passes, so the first cache-building pass is slower.
+Final deterministic crops are cached separately by the full spatial settings
+and preprocessing version. **Random training ignores the clip cache** so that
+each draw can select a new position; decoding can therefore be slower every
+epoch. Validation random crops are deterministic and cacheable.
+
+Settings are stored in `config.json` and both checkpoints. `eval_stage1.py`
+and submission `predict_stage1` read them automatically. Use the updated
+`inference.py` when packaging a new spatial model. Existing three-argument
+calls to `_decode_stage1_clip` still mean **legacy center crop**; when using
+the custom R021–R056 notebook, update its imports and decode call explicitly:
+
+```python
+from inference import _clip_ids, _decode_stage1_clip, _stage1_spatial_config
+
+# After loading checkpoint; also works with old checkpoints.
+spatial = _stage1_spatial_config(checkpoint)
+print("Evaluation spatial settings:", spatial)
+
+# Inside the existing video loop:
+frame_ids = _clip_ids(path, frames=frames, slot=0, slots=1)
+clip = _decode_stage1_clip(path, size, frame_ids, spatial=spatial)
+```
+
+Local CPU checks: `python -m unittest discover -s tests -v`.
+
 Evaluate a Stage 1 checkpoint on labeled source and recaptured MP4 files using
 the exact preprocessing implemented by submission inference:
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from inference import SPATIAL_MODES, _spatial_config
 
 from src.common.runtime import default_device, set_seed
 from src.stage1.checkpoint import append_metrics, save_checkpoint, save_config
@@ -56,6 +57,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--frames", type=int, default=16)
     parser.add_argument("--size", type=int, default=224)
+    parser.add_argument("--spatial-mode", choices=SPATIAL_MODES, default="center",
+                        help="Direct only: legacy center, native-center, random or FFT crop")
+    parser.add_argument("--crop-size", type=int, default=224,
+                        help="Native pixel crop edge before resizing to --size")
+    parser.add_argument("--crop-grid", type=int, default=5,
+                        help="Candidate positions per axis, shared by random and FFT")
+    parser.add_argument("--fft-min-freq", type=float, default=0.25,
+                        help="FFT radial high-band cutoff in cycles/pixel (0 < value < 0.5)")
     parser.add_argument("--expected-source-frames", type=int, default=60)
     parser.add_argument("--optimizer", choices=("adamw", "sgd"), default="adamw")
     parser.add_argument("--scheduler", choices=("cosine", "none"), default="cosine")
@@ -105,6 +114,10 @@ def parse_args() -> argparse.Namespace:
 
 def _resolved_config(args: argparse.Namespace) -> dict:
     config = vars(args).copy()
+    config["spatial"] = _spatial_config(
+        mode=args.spatial_mode, crop_size=args.crop_size,
+        grid_size=args.crop_grid, seed=args.seed, fft_min_freq=args.fft_min_freq,
+    )
     for name in (
         "data_dir",
         "model_dir",
@@ -146,6 +159,7 @@ def _build_dataloaders(args: argparse.Namespace) -> tuple:
         num_workers=args.num_workers,
         seed=args.seed,
         balanced_sampling=args.balanced_sampling,
+        spatial=_resolved_config(args)["spatial"],
     )
 
 
@@ -210,6 +224,9 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("epochs must be greater than zero")
     if args.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience cannot be negative")
+    if args.dataset != "direct" and args.spatial_mode != "center":
+        raise ValueError("Spatial crop experiments currently require --dataset direct")
+    config = _resolved_config(args)
 
     model_dir = args.model_dir.expanduser().resolve()
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +237,6 @@ def run(args: argparse.Namespace) -> Path:
             "Use a new --model-dir for each experiment."
         )
 
-    config = _resolved_config(args)
     save_config(model_dir, config)
     set_seed(args.seed)
     device = default_device()
@@ -250,6 +266,9 @@ def run(args: argparse.Namespace) -> Path:
 
     print(f"device: {device}")
     print(f"dataset: {args.dataset}")
+    print(f"spatial preprocessing: {config['spatial']}")
+    if args.spatial_mode == "random" and args.cache_dir is not None:
+        print("Random TRAIN crops are not cached; validation crops use a fixed filename/seed.")
     if args.dataset == "baidu":
         print(f"data: {args.data_dir.expanduser().resolve()}")
     else:

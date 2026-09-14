@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from inference import _clip_ids, _decode_stage1_clip
+from inference import _clip_ids, _decode_stage1_clip, _spatial_config, _spatial_cache_tag
 
 
 LABEL_TO_INDEX = {
@@ -53,6 +53,7 @@ class DirectStage1Dataset(Dataset):
         frames: int = 16,
         size: int = 224,
         cache_dir: str | Path | None = None,
+        spatial: dict | None = None,
     ) -> None:
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")
@@ -70,6 +71,7 @@ class DirectStage1Dataset(Dataset):
         )
         self.frames = frames
         self.size = size
+        self.spatial = _spatial_config(**(spatial or {}))
         self.cache_dir = (
             Path(cache_dir).expanduser().resolve()
             if cache_dir is not None
@@ -141,8 +143,14 @@ class DirectStage1Dataset(Dataset):
     def _cache_path(self, sample: dict) -> Path | None:
         if self.cache_dir is None:
             return None
+        # Caching the final crop would freeze random augmentation after one draw.
+        if self.split == "train" and self.spatial["mode"] == "random":
+            return None
+        spatial_root = self.cache_dir
+        if self.spatial["mode"] != "center":
+            spatial_root = spatial_root / _spatial_cache_tag(self.spatial)
         return (
-            self.cache_dir
+            spatial_root
             / f"frames_{self.frames}_size_{self.size}"
             / sample["kind"]
             / f"{sample['video_id']}.pt"
@@ -150,7 +158,10 @@ class DirectStage1Dataset(Dataset):
 
     def _decode(self, path: Path) -> torch.Tensor:
         frame_ids = _clip_ids(path, self.frames, slot=0, slots=1)
-        return _decode_stage1_clip(path, self.size, frame_ids)
+        return _decode_stage1_clip(
+            path, self.size, frame_ids, spatial=self.spatial,
+            training=self.split == "train",
+        )
 
     def _load_clip(self, sample: dict) -> torch.Tensor:
         cache_path = self._cache_path(sample)

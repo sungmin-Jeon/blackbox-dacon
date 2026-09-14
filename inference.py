@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 from pathlib import Path
 
 import cv2
@@ -50,27 +52,119 @@ def _clip_ids(path: Path, frames: int, slot: int, slots: int):
     return np.linspace(start, min(total - 1, start + frames - 1), frames).round().astype(int)
 
 
-def _decode_stage1_clip(path: Path, size: int, frame_ids):
+SPATIAL_VERSION = 1
+SPATIAL_MODES = ("center", "native-center", "random", "fft")
+
+
+def _spatial_config(mode="center", crop_size=224, grid_size=5, seed=42,
+                    fft_min_freq=0.25, version=SPATIAL_VERSION):
+    """Versioned preprocessing, shared by training, evaluation and submission."""
+    if mode not in SPATIAL_MODES:
+        raise ValueError(f"Unknown spatial mode: {mode}")
+    if crop_size < 2 or grid_size < 1:
+        raise ValueError("crop_size must be >= 2 and grid_size must be >= 1")
+    if not 0 < fft_min_freq < 0.5:
+        raise ValueError("fft_min_freq must be between 0 and 0.5 cycles/pixel")
+    if version != SPATIAL_VERSION:
+        raise ValueError(f"Unsupported spatial preprocessing version: {version}")
+    return dict(mode=mode, crop_size=int(crop_size), grid_size=int(grid_size),
+                seed=int(seed), fft_min_freq=float(fft_min_freq), version=version)
+
+
+def _stage1_spatial_config(checkpoint):
+    """Old checkpoints retain the original resize + center-crop behavior."""
+    return _spatial_config(**checkpoint.get("config", {}).get("spatial", {}))
+
+
+def _spatial_cache_tag(spatial):
+    spatial = _spatial_config(**spatial)
+    digest = hashlib.sha256(json.dumps(spatial, sort_keys=True).encode()).hexdigest()[:16]
+    return f"spatial_v{SPATIAL_VERSION}_{spatial['mode']}_{digest}"
+
+
+def _crop_candidates(height, width, crop_size, grid_size):
+    if min(height, width) < crop_size:
+        raise ValueError(f"Native crop {crop_size} exceeds frame {width}x{height}")
+    ys = np.unique(np.linspace(0, height - crop_size, grid_size).round().astype(int))
+    xs = np.unique(np.linspace(0, width - crop_size, grid_size).round().astype(int))
+    return [(int(y), int(x)) for y in ys for x in xs]
+
+
+def _fft_patch_score(rgb, min_freq=0.25):
+    """Mean high-frequency power of mean-centered, Hann-windowed luminance.
+
+    Frequency units are cycles/pixel, using fftfreq (NOT array-index order).
+    This radial-band score is a video-experiment adaptation, not a reproduction
+    of the DGOAS paper's single-bin patch score. It is not a replay probability.
+    """
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    height, width = gray.shape
+    window = np.outer(np.hanning(height), np.hanning(width))
+    spectrum = np.fft.fft2((gray - gray.mean()) * window, norm="ortho")
+    fy = np.fft.fftfreq(height)[:, None]
+    fx = np.fft.fftfreq(width)[None, :]
+    mask = np.hypot(fy, fx) >= min_freq
+    return float(np.mean(np.abs(spectrum[mask]) ** 2))
+
+
+def _read_stage1_frames(path, wanted):
     capture = cv2.VideoCapture(str(path))
-    wanted = [int(index) for index in frame_ids]
-    if not wanted:
-        capture.release()
-        raise ValueError(f"no frame ids requested: {path.name}")
     if not capture.isOpened():
         capture.release()
         raise ValueError(f"cannot open video: {path.name}")
-
-    output = []
     try:
         for index in wanted:
-            # Jump to each requested position instead of decoding every frame in
-            # between. This matters especially for long 4K/HEVC videos.
             capture.set(cv2.CAP_PROP_POS_FRAMES, index)
             ok, bgr = capture.read()
-            if not ok or bgr is None:
-                continue
+            if ok and bgr is not None:
+                yield cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    finally:
+        capture.release()
 
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+def _decode_stage1_clip(path: Path, size: int, frame_ids, *, spatial=None,
+                        training=False):
+    """One spatially consistent clip, always [3, len(frame_ids), size, size].
+
+    FFT uses a streaming scoring pass then a crop pass, avoiding retention of
+    all full-resolution frames in RAM. Random validation is filename/seed based
+    so moving the same files between Colab and Drive does not change crops.
+    """
+    path = Path(path)
+    wanted = [int(index) for index in frame_ids]
+    if not wanted or size <= 0:
+        raise ValueError("frame_ids must be nonempty and size must be positive")
+    options = _spatial_config(**(spatial or {}))
+    mode = options["mode"]
+    crop_size = options["crop_size"]
+    coordinates = None
+    frame_shape = None
+
+    if mode == "fft":
+        scores = None
+        candidates = None
+        for rgb in _read_stage1_frames(path, wanted):
+            if frame_shape is None:
+                frame_shape = rgb.shape[:2]
+                candidates = _crop_candidates(*frame_shape, crop_size, options["grid_size"])
+                scores = np.zeros(len(candidates), dtype=np.float64)
+            elif rgb.shape[:2] != frame_shape:
+                raise ValueError(f"Frame dimensions change within {path.name}")
+            for i, (top, left) in enumerate(candidates):
+                scores[i] += _fft_patch_score(
+                    rgb[top:top + crop_size, left:left + crop_size],
+                    options["fft_min_freq"],
+                )
+        if scores is None:
+            raise ValueError(f"cannot decode video: {path.name}")
+        # Every candidate sees the same frames: sum and mean give the same rank.
+        # np.argmax deterministically selects the first candidate on a tie.
+        coordinates = candidates[int(np.argmax(scores))]
+
+    output = []
+    for rgb in _read_stage1_frames(path, wanted):
+        if mode == "center":
+            # Preserve the historical preprocessing exactly for old experiments.
             height, width = rgb.shape[:2]
             scale = size / min(height, width)
             resized_height = max(size, round(height * scale))
@@ -79,8 +173,29 @@ def _decode_stage1_clip(path: Path, size: int, frame_ids):
             top = (resized_height - size) // 2
             left = (resized_width - size) // 2
             output.append(rgb[top : top + size, left : left + size])
-    finally:
-        capture.release()
+            continue
+
+        if frame_shape is None:
+            frame_shape = rgb.shape[:2]
+        elif rgb.shape[:2] != frame_shape:
+            raise ValueError(f"Frame dimensions change within {path.name}")
+        if coordinates is None:
+            height, width = frame_shape
+            candidates = _crop_candidates(height, width, crop_size, options["grid_size"])
+            if mode == "native-center":
+                coordinates = ((height - crop_size) // 2, (width - crop_size) // 2)
+            elif training:
+                coordinates = candidates[int(np.random.randint(len(candidates)))]
+            else:
+                key = f"{options['seed']}:{path.name}".encode()
+                seed = int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
+                rng = np.random.default_rng(seed)
+                coordinates = candidates[int(rng.integers(len(candidates)))]
+        top, left = coordinates
+        patch = rgb[top:top + crop_size, left:left + crop_size]
+        if crop_size != size:
+            patch = cv2.resize(patch, (size, size), interpolation=cv2.INTER_AREA)
+        output.append(patch)
 
     if not output:
         raise ValueError(f"cannot decode video: {path.name}")
@@ -92,11 +207,12 @@ def _decode_stage1_clip(path: Path, size: int, frame_ids):
 
 
 class _Stage1Clips(Dataset):
-    def __init__(self, videos, slots: int, size: int, frames: int) -> None:
+    def __init__(self, videos, slots: int, size: int, frames: int, spatial=None) -> None:
         self.videos = videos
         self.slots = slots
         self.size = size
         self.frames = frames
+        self.spatial = _spatial_config(**(spatial or {}))
 
     def __len__(self) -> int:
         return len(self.videos) * self.slots
@@ -105,7 +221,8 @@ class _Stage1Clips(Dataset):
         video_index, slot = index // self.slots, index % self.slots
         path = self.videos[video_index]
         try:
-            clip = _decode_stage1_clip(path, self.size, _clip_ids(path, self.frames, slot, self.slots))
+            clip = _decode_stage1_clip(path, self.size, _clip_ids(path, self.frames, slot, self.slots),
+                                       spatial=self.spatial)
             valid = 1
         except Exception:
             clip = torch.zeros(3, self.frames, self.size, self.size)
@@ -126,7 +243,7 @@ def predict_stage1(data_dir, model_dir):
     videos = _video_paths(Path(data_dir) / "videos")
     # Match Baidu training: sample one 16-frame clip uniformly over the video.
     slots = 1
-    dataset = _Stage1Clips(videos, slots, size, frames)
+    dataset = _Stage1Clips(videos, slots, size, frames, _stage1_spatial_config(checkpoint))
     loader = DataLoader(dataset, batch_size=4, num_workers=4, pin_memory=True)
     scores = [[] for _ in videos]
 

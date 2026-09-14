@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.models.video import mvit_v2_s
 from tqdm.auto import tqdm
 
-from inference import _clip_ids, _decode_stage1_clip
+from inference import _clip_ids, _decode_stage1_clip, _stage1_spatial_config
 from src.common.runtime import default_device
 from src.stage1.metrics import classification_metrics
 
@@ -104,10 +104,11 @@ def build_samples(data_dir: Path) -> list[dict]:
 
 
 class Stage1VideoDataset(Dataset):
-    def __init__(self, samples: list[dict], *, frames: int, size: int) -> None:
+    def __init__(self, samples: list[dict], *, frames: int, size: int, spatial=None) -> None:
         self.samples = samples
         self.frames = frames
         self.size = size
+        self.spatial = spatial
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -115,7 +116,7 @@ class Stage1VideoDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
         path = self.samples[index]["path"]
         frame_ids = _clip_ids(path, self.frames, slot=0, slots=1)
-        clip = _decode_stage1_clip(path, self.size, frame_ids)
+        clip = _decode_stage1_clip(path, self.size, frame_ids, spatial=self.spatial)
         return clip, index
 
 
@@ -166,7 +167,8 @@ def main() -> None:
     model.to(device).eval()
 
     samples = build_samples(data_dir)
-    dataset = Stage1VideoDataset(samples, frames=frames, size=size)
+    spatial = _stage1_spatial_config(checkpoint)
+    dataset = Stage1VideoDataset(samples, frames=frames, size=size, spatial=spatial)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -239,6 +241,7 @@ def main() -> None:
     print(f"checkpoint: {checkpoint_path}")
     print(f"videos: {len(result)}")
     print(f"frames/size: {frames}/{size}")
+    print(f"spatial preprocessing: {spatial}")
     print(f"accuracy: {metrics.accuracy:.4f}")
     print(f"Macro-F1: {metrics.macro_f1:.4f}")
     print(f"ORIGINAL F1: {metrics.original_f1:.4f}")

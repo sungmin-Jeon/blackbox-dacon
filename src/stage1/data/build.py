@@ -114,6 +114,7 @@ def build_direct_datasets(
     cache_dir: str | Path | None = None,
     spatial: dict | None = None,
     temporal: dict | None = None,
+    augmentation: dict | None = None,
 ) -> tuple[DirectStage1Dataset, DirectStage1Dataset]:
     """Build train/validation datasets from stage1_split.csv."""
 
@@ -127,6 +128,7 @@ def build_direct_datasets(
         split="train",
         spatial=spatial,
         temporal=temporal,
+        augmentation=augmentation,
         video_root=video_root,
         frames=frames,
         size=size,
@@ -138,6 +140,7 @@ def build_direct_datasets(
         split="val",
         spatial=spatial,
         temporal=temporal,
+        augmentation=augmentation,
         video_root=video_root,
         frames=frames,
         size=size,
@@ -192,6 +195,7 @@ def build_direct_dataloaders(
     cache_dir: str | Path | None = None,
     spatial: dict | None = None,
     temporal: dict | None = None,
+    augmentation: dict | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Build Direct train and validation DataLoaders."""
 
@@ -221,6 +225,7 @@ def build_direct_dataloaders(
         cache_dir=cache_dir,
         spatial=spatial,
         temporal=temporal,
+        augmentation=augmentation,
     )
 
     if val_batch_size is None:

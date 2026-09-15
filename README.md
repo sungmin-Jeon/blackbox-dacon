@@ -67,6 +67,37 @@ When initializing from an existing Stage 1 checkpoint, choose how much of the
 MViT to update with `--fine-tune-scope`: `full` (default), `head`, or
 `last-block` (the final MViT block, final norm, and classification head).
 
+## Direct weak-augmentation experiment (Colab)
+
+`--augmentation-mode weak` applies a horizontal flip plus mild brightness,
+contrast, and saturation jitter to Direct training clips. One random value is
+sampled per transform and shared by all 16 frames, preserving temporal
+consistency. The base decoded clip remains cacheable; augmentation is applied
+after cache loading. Validation and submission inference are unchanged.
+
+The clean ablation from the strongest uniform/center setup is:
+
+```python
+%cd /content/blackbox-dacon
+!python train_stage1.py \
+  --dataset direct \
+  --split-csv "/content/drive/MyDrive/2026_Dacon/data/stage1/stage1_split_R001_R020_restored.csv" \
+  --video-root "/content/direct_stage1" \
+  --cache-dir "/content/stage1_clip_cache_v1" \
+  --model-dir "/content/drive/MyDrive/2026_Dacon/sungmin/stage1/v1/direct_full_uniform_weakaug_v1" \
+  --fine-tune-scope full \
+  --temporal-mode uniform --temporal-eval-mode auto \
+  --spatial-mode center --augmentation-mode weak \
+  --aug-flip-probability 0.5 \
+  --aug-brightness 0.1 --aug-contrast 0.1 --aug-saturation 0.1 \
+  --frames 16 --size 224 --epochs 30 --batch-size 2 \
+  --num-workers 2 --lr 1e-5 --seed 42 --early-stopping-patience 7
+```
+
+The defaults shown above are intentionally weak. Apply them identically to
+ORIGINAL and RERECORDED training samples; class-specific augmentation could
+become a label shortcut. `--augmentation-mode none` preserves previous runs.
+
 ## Direct temporal-view experiments (Colab)
 
 Temporal sampling is versioned in the checkpoint and shared by Direct

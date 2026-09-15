@@ -17,6 +17,7 @@ from inference import (
 )
 
 from src.common.runtime import default_device, set_seed
+from src.stage1.augmentation import AUGMENTATION_MODES, augmentation_config
 from src.stage1.checkpoint import append_metrics, save_checkpoint, save_config
 from src.stage1.data import build_baidu_dataloaders, build_direct_dataloaders
 from src.stage1.engine import train_one_epoch, validate
@@ -88,6 +89,16 @@ def parse_args() -> argparse.Namespace:
         default=15.0,
         help="Target FPS used to normalize frame spacing inside each multi-burst",
     )
+    parser.add_argument(
+        "--augmentation-mode",
+        choices=AUGMENTATION_MODES,
+        default="none",
+        help="Direct TRAIN only: no augmentation or weak clip-consistent augmentation",
+    )
+    parser.add_argument("--aug-flip-probability", type=float, default=0.5)
+    parser.add_argument("--aug-brightness", type=float, default=0.1)
+    parser.add_argument("--aug-contrast", type=float, default=0.1)
+    parser.add_argument("--aug-saturation", type=float, default=0.1)
     parser.add_argument("--spatial-mode", choices=SPATIAL_MODES, default="center",
                         help="Direct only: legacy center, native-center, random or FFT crop")
     parser.add_argument("--crop-size", type=int, default=224,
@@ -155,6 +166,13 @@ def _resolved_config(args: argparse.Namespace) -> dict:
         bursts=args.temporal_bursts,
         target_fps=args.temporal_target_fps,
     )
+    config["augmentation"] = augmentation_config(
+        mode=args.augmentation_mode,
+        flip_probability=args.aug_flip_probability,
+        brightness=args.aug_brightness,
+        contrast=args.aug_contrast,
+        saturation=args.aug_saturation,
+    )
     for name in (
         "data_dir",
         "model_dir",
@@ -198,6 +216,7 @@ def _build_dataloaders(args: argparse.Namespace) -> tuple:
         balanced_sampling=args.balanced_sampling,
         spatial=_resolved_config(args)["spatial"],
         temporal=_resolved_config(args)["temporal"],
+        augmentation=_resolved_config(args)["augmentation"],
     )
 
 
@@ -264,6 +283,15 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("early_stopping_patience cannot be negative")
     if args.dataset != "direct" and args.spatial_mode != "center":
         raise ValueError("Spatial crop experiments currently require --dataset direct")
+    augmentation = augmentation_config(
+        mode=args.augmentation_mode,
+        flip_probability=args.aug_flip_probability,
+        brightness=args.aug_brightness,
+        contrast=args.aug_contrast,
+        saturation=args.aug_saturation,
+    )
+    if args.dataset != "direct" and augmentation["mode"] != "none":
+        raise ValueError("Stage 1 augmentation currently requires --dataset direct")
     temporal = _temporal_config(
         mode=args.temporal_mode,
         eval_mode=args.temporal_eval_mode,
@@ -317,6 +345,9 @@ def run(args: argparse.Namespace) -> Path:
     print(f"dataset: {args.dataset}")
     print(f"temporal sampling: {config['temporal']}")
     print(f"spatial preprocessing: {config['spatial']}")
+    print(f"training augmentation: {config['augmentation']}")
+    if args.augmentation_mode == "weak":
+        print("Weak augmentation is clip-consistent and applies to TRAIN only.")
     if args.spatial_mode == "random" and args.cache_dir is not None:
         print("Random TRAIN crops are not cached; validation crops use a fixed filename/seed.")
     if args.temporal_mode == "multi-burst" and args.cache_dir is not None:

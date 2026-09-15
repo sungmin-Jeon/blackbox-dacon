@@ -19,6 +19,7 @@ from inference import (
     _temporal_eval_views,
     _validate_temporal_frames,
 )
+from src.stage1.augmentation import augmentation_config, augment_stage1_clip
 
 
 LABEL_TO_INDEX = {
@@ -64,6 +65,7 @@ class DirectStage1Dataset(Dataset):
         cache_dir: str | Path | None = None,
         spatial: dict | None = None,
         temporal: dict | None = None,
+        augmentation: dict | None = None,
     ) -> None:
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")
@@ -83,6 +85,7 @@ class DirectStage1Dataset(Dataset):
         self.size = size
         self.spatial = _spatial_config(**(spatial or {}))
         self.temporal = _temporal_config(**(temporal or {}))
+        self.augmentation = augmentation_config(**(augmentation or {}))
         _validate_temporal_frames(self.frames, self.temporal)
         self.cache_dir = (
             Path(cache_dir).expanduser().resolve()
@@ -240,6 +243,8 @@ class DirectStage1Dataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[index]
         clip = self._load_clip(sample)
+        if self.split == "train":
+            clip = augment_stage1_clip(clip, self.augmentation)
         label = torch.tensor(sample["label"], dtype=torch.long)
         return clip, label
 

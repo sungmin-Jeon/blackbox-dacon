@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of segments used by multi-burst; --frames must be divisible by it",
     )
+    parser.add_argument(
+        "--temporal-target-fps",
+        type=float,
+        default=15.0,
+        help="Target FPS used to normalize frame spacing inside each multi-burst",
+    )
     parser.add_argument("--spatial-mode", choices=SPATIAL_MODES, default="center",
                         help="Direct only: legacy center, native-center, random or FFT crop")
     parser.add_argument("--crop-size", type=int, default=224,
@@ -147,6 +153,7 @@ def _resolved_config(args: argparse.Namespace) -> dict:
         mode=args.temporal_mode,
         eval_mode=args.temporal_eval_mode,
         bursts=args.temporal_bursts,
+        target_fps=args.temporal_target_fps,
     )
     for name in (
         "data_dir",
@@ -261,6 +268,7 @@ def run(args: argparse.Namespace) -> Path:
         mode=args.temporal_mode,
         eval_mode=args.temporal_eval_mode,
         bursts=args.temporal_bursts,
+        target_fps=args.temporal_target_fps,
     )
     if args.dataset != "direct" and (
         temporal["mode"] != "uniform" or temporal["eval_mode"] != "uniform"
@@ -311,8 +319,10 @@ def run(args: argparse.Namespace) -> Path:
     print(f"spatial preprocessing: {config['spatial']}")
     if args.spatial_mode == "random" and args.cache_dir is not None:
         print("Random TRAIN crops are not cached; validation crops use a fixed filename/seed.")
-    if args.temporal_mode != "uniform" and args.cache_dir is not None:
-        print("Augmented TRAIN temporal clips are not cached; validation clips are deterministic.")
+    if args.temporal_mode == "multi-burst" and args.cache_dir is not None:
+        print("Fixed FPS-normalized TRAIN/validation multi-burst clips are cached.")
+    elif args.temporal_mode == "mixed" and args.cache_dir is not None:
+        print("Mixed TRAIN temporal clips are not cached; validation clips are deterministic.")
     if args.dataset == "baidu":
         print(f"data: {args.data_dir.expanduser().resolve()}")
     else:

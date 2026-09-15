@@ -155,10 +155,15 @@ class DirectStage1Dataset(Dataset):
     def _cache_path(self, sample: dict) -> Path | None:
         if self.cache_dir is None:
             return None
-        # Caching would freeze either random spatial or temporal augmentation.
+        # Random spatial crops and mixed temporal mode are stochastic training
+        # augmentations. Version-2 multi-burst is fixed and safe to cache.
         if self.split == "train" and (
             self.spatial["mode"] == "random"
-            or self.temporal["mode"] != "uniform"
+            or self.temporal["mode"] == "mixed"
+            or (
+                self.temporal["version"] == 1
+                and self.temporal["mode"] != "uniform"
+            )
         ):
             return None
         spatial_root = self.cache_dir

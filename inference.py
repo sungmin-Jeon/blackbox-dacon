@@ -53,13 +53,14 @@ def _clip_ids(path: Path, frames: int, slot: int, slots: int):
     return np.linspace(start, min(total - 1, start + frames - 1), frames).round().astype(int)
 
 
-TEMPORAL_VERSION = 1
+TEMPORAL_VERSION = 2
+SUPPORTED_TEMPORAL_VERSIONS = (1, TEMPORAL_VERSION)
 TEMPORAL_TRAIN_MODES = ("uniform", "multi-burst", "mixed")
 TEMPORAL_EVAL_MODES = ("uniform", "multi-burst", "both")
 
 
 def _temporal_config(mode="uniform", eval_mode="auto", bursts=4,
-                     version=TEMPORAL_VERSION):
+                     target_fps=15.0, version=TEMPORAL_VERSION):
     """Versioned Stage 1 temporal sampling configuration.
 
     ``mode`` controls Direct training. ``eval_mode`` controls validation and
@@ -78,14 +79,25 @@ def _temporal_config(mode="uniform", eval_mode="auto", bursts=4,
         raise ValueError(f"Unknown temporal evaluation mode: {eval_mode}")
     if bursts < 1:
         raise ValueError("temporal bursts must be at least one")
-    if version != TEMPORAL_VERSION:
+    if not np.isfinite(target_fps) or target_fps <= 0:
+        raise ValueError("temporal target FPS must be greater than zero")
+    if version not in SUPPORTED_TEMPORAL_VERSIONS:
         raise ValueError(f"Unsupported temporal preprocessing version: {version}")
-    return dict(mode=mode, eval_mode=eval_mode, bursts=int(bursts), version=version)
+    return dict(
+        mode=mode,
+        eval_mode=eval_mode,
+        bursts=int(bursts),
+        target_fps=float(target_fps),
+        version=int(version),
+    )
 
 
 def _stage1_temporal_config(checkpoint):
     """Restore temporal settings while keeping old checkpoints unchanged."""
-    return _temporal_config(**checkpoint.get("config", {}).get("temporal", {}))
+    saved = checkpoint.get("config", {}).get("temporal")
+    if saved is None:
+        return _temporal_config(version=1)
+    return _temporal_config(**saved)
 
 
 def _temporal_eval_views(temporal):
@@ -115,17 +127,23 @@ def _validate_temporal_frames(frames, temporal):
 def _temporal_cache_tag(temporal):
     temporal = _temporal_config(**temporal)
     digest = hashlib.sha256(json.dumps(temporal, sort_keys=True).encode()).hexdigest()[:16]
-    return f"temporal_v{TEMPORAL_VERSION}_{temporal['mode']}_{temporal['eval_mode']}_{digest}"
+    return (
+        f"temporal_v{temporal['version']}_{temporal['mode']}_"
+        f"{temporal['eval_mode']}_{digest}"
+    )
 
 
 def _temporal_frame_ids(total, frames, *, mode="uniform", bursts=4,
-                        training=False):
+                        training=False, fps=None, target_fps=15.0,
+                        version=TEMPORAL_VERSION):
     """Select one chronological Stage 1 view from a known frame count.
 
-    Multi-burst splits the whole video into ``bursts`` segments and takes a
-    consecutive burst inside each segment. Training jitters each burst start;
-    evaluation uses the centered start. Empty/short segments repeat valid
-    indices so the output length remains exactly ``frames``.
+    Multi-burst splits the whole video into ``bursts`` segments. Version 2
+    always centers each burst and spaces its frames at a target-rate-normalized
+    stride. For example, target 15 FPS uses raw strides 1/2/4 for videos stored
+    at 15/30/60 FPS. Version 1 retains the original consecutive-frame training
+    jitter for existing checkpoints. Empty/short segments repeat valid indices
+    so the output length remains exactly ``frames``.
     """
     total = max(1, int(total))
     frames = int(frames)
@@ -134,6 +152,10 @@ def _temporal_frame_ids(total, frames, *, mode="uniform", bursts=4,
         raise ValueError("frames must be at least one")
     if bursts < 1:
         raise ValueError("temporal bursts must be at least one")
+    if not np.isfinite(target_fps) or target_fps <= 0:
+        raise ValueError("temporal target FPS must be greater than zero")
+    if version not in SUPPORTED_TEMPORAL_VERSIONS:
+        raise ValueError(f"Unsupported temporal preprocessing version: {version}")
 
     if mode == "mixed":
         if not training:
@@ -149,6 +171,14 @@ def _temporal_frame_ids(total, frames, *, mode="uniform", bursts=4,
         )
 
     frames_per_burst = frames // bursts
+    source_fps = float(fps) if fps is not None else float(target_fps)
+    if not np.isfinite(source_fps) or source_fps <= 0:
+        source_fps = float(target_fps)
+    frame_stride = (
+        1
+        if version == 1
+        else max(1, int(round(source_fps / float(target_fps))))
+    )
     boundaries = np.linspace(0, total, bursts + 1).astype(int)
     selected = []
     for burst_index in range(bursts):
@@ -156,13 +186,14 @@ def _temporal_frame_ids(total, frames, *, mode="uniform", bursts=4,
         stop = int(boundaries[burst_index + 1])
         segment_length = stop - first
 
-        if segment_length >= frames_per_burst:
-            latest_start = stop - frames_per_burst
-            if training:
+        required_length = 1 + (frames_per_burst - 1) * frame_stride
+        if segment_length >= required_length:
+            latest_start = stop - required_length
+            if version == 1 and training:
                 start = int(np.random.randint(first, latest_start + 1))
             else:
-                start = first + (segment_length - frames_per_burst) // 2
-            burst_ids = np.arange(start, start + frames_per_burst, dtype=int)
+                start = first + (segment_length - required_length) // 2
+            burst_ids = start + np.arange(frames_per_burst, dtype=int) * frame_stride
         elif segment_length > 0:
             burst_ids = np.linspace(
                 first, stop - 1, frames_per_burst
@@ -179,14 +210,22 @@ def _temporal_frame_ids(total, frames, *, mode="uniform", bursts=4,
 
 def _temporal_clip_ids(path: Path, frames: int, *, temporal=None,
                        training=False, view=None):
-    """Read a video's frame count and select one configured temporal view."""
+    """Read a video's frame count/FPS and select one configured temporal view."""
     options = _temporal_config(**(temporal or {}))
     mode = options["mode"] if view is None else view
     capture = cv2.VideoCapture(str(path))
     total = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
     capture.release()
     return _temporal_frame_ids(
-        total, frames, mode=mode, bursts=options["bursts"], training=training,
+        total,
+        frames,
+        mode=mode,
+        bursts=options["bursts"],
+        training=training,
+        fps=fps,
+        target_fps=options["target_fps"],
+        version=options["version"],
     )
 
 

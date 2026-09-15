@@ -27,7 +27,13 @@ class TemporalTests(unittest.TestCase):
         temporal = _stage1_temporal_config({})
         self.assertEqual(
             temporal,
-            {"mode": "uniform", "eval_mode": "uniform", "bursts": 4, "version": 1},
+            {
+                "mode": "uniform",
+                "eval_mode": "uniform",
+                "bursts": 4,
+                "target_fps": 15.0,
+                "version": 1,
+            },
         )
         self.assertEqual(_temporal_eval_views(temporal), ("uniform",))
 
@@ -53,21 +59,41 @@ class TemporalTests(unittest.TestCase):
         for burst in actual.reshape(4, 4):
             np.testing.assert_array_equal(np.diff(burst), np.ones(3, dtype=int))
 
-    def test_training_jitter_is_seeded_and_stays_inside_segments(self):
+    def test_v2_multi_burst_is_fixed_and_fps_normalized(self):
+        configurations = ((150, 15, 1), (300, 30, 2), (600, 60, 4))
+        for total, fps, expected_stride in configurations:
+            with self.subTest(fps=fps):
+                evaluated = _temporal_frame_ids(
+                    total, 16, mode="multi-burst", bursts=4, fps=fps,
+                )
+                trained = _temporal_frame_ids(
+                    total, 16, mode="multi-burst", bursts=4, fps=fps,
+                    training=True,
+                )
+                np.testing.assert_array_equal(trained, evaluated)
+                for burst in evaluated.reshape(4, 4):
+                    np.testing.assert_array_equal(
+                        np.diff(burst),
+                        np.full(3, expected_stride, dtype=int),
+                    )
+
+    def test_v1_training_jitter_remains_checkpoint_compatible(self):
         np.random.seed(42)
         first = _temporal_frame_ids(
-            300, 16, mode="multi-burst", bursts=4, training=True
+            300, 16, mode="multi-burst", bursts=4, training=True, version=1,
         )
         np.random.seed(42)
         np.testing.assert_array_equal(
             first,
             _temporal_frame_ids(
-                300, 16, mode="multi-burst", bursts=4, training=True
+                300, 16, mode="multi-burst", bursts=4, training=True,
+                version=1,
             ),
         )
         draws = [
             _temporal_frame_ids(
-                300, 16, mode="multi-burst", bursts=4, training=True
+                300, 16, mode="multi-burst", bursts=4, training=True,
+                version=1,
             )
             for _ in range(8)
         ]
@@ -87,6 +113,7 @@ class TemporalTests(unittest.TestCase):
             {"mode": "typo"},
             {"eval_mode": "typo"},
             {"bursts": 0},
+            {"target_fps": 0},
             {"version": 999},
         ):
             with self.assertRaises(ValueError):
@@ -147,6 +174,48 @@ class TemporalTests(unittest.TestCase):
                 self.assertEqual((video_index, submitted_index, valid), (0, 0, 1))
                 self.assertEqual(view, expected_view)
                 self.assertTrue(torch.equal(evaluated, submitted))
+
+    def test_fixed_v2_multi_burst_training_is_cacheable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "R001.avi"
+            writer = cv2.VideoWriter(
+                str(video), cv2.VideoWriter_fourcc(*"MJPG"), 30, (64, 48)
+            )
+            self.assertTrue(writer.isOpened())
+            for frame_index in range(64):
+                rgb = np.full((48, 64, 3), frame_index * 3, dtype=np.uint8)
+                writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            writer.release()
+
+            rows = [
+                dict(
+                    source_id=f"R{index:03d}",
+                    video_id=f"{split}_{label}",
+                    kind="source" if label == "ORIGINAL" else "recaptured",
+                    label=label,
+                    split=split,
+                    path=str(video),
+                )
+                for index, split in enumerate(("train", "val"), 1)
+                for label in ("ORIGINAL", "RERECORDED")
+            ]
+            manifest = root / "split.csv"
+            pd.DataFrame(rows).to_csv(manifest, index=False)
+            temporal = _temporal_config(mode="multi-burst", bursts=4)
+            train, _ = build_direct_datasets(
+                manifest,
+                frames=16,
+                size=32,
+                cache_dir=root / "cache",
+                temporal=temporal,
+            )
+
+            cache_path = train._cache_path(train.samples[0])
+            self.assertIsNotNone(cache_path)
+            first = train[0][0]
+            self.assertTrue(cache_path.is_file())
+            torch.testing.assert_close(train[0][0], first, atol=1e-3, rtol=1e-3)
 
     def test_validation_averages_view_probabilities(self):
         class MeanLogitModel(torch.nn.Module):

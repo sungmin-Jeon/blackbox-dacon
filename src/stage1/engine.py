@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -48,6 +50,10 @@ def train_one_epoch(
 
     progress = tqdm(loader, desc="train", leave=False)
     for clips, labels in progress:
+        if clips.ndim != 5:
+            raise ValueError(
+                f"Training expects one temporal view [B,C,T,H,W], got {tuple(clips.shape)}"
+            )
         clips = clips.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -101,10 +107,33 @@ def validate(
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
-            logits = model(clips)
-            loss = criterion(logits, labels)
+            if clips.ndim == 5:
+                logits = model(clips)
+                loss = criterion(logits, labels)
+                predicted = logits.argmax(dim=1)
+            elif clips.ndim == 6:
+                views = clips.size(1)
+                # Run views sequentially so two-view validation does not double
+                # the peak MViT batch memory.
+                view_log_probabilities = torch.stack(
+                    [
+                        F.log_softmax(model(clips[:, view]).float(), dim=1)
+                        for view in range(views)
+                    ],
+                    dim=1,
+                )
+                # Match submission inference: arithmetic mean of per-view probabilities.
+                log_probabilities = torch.logsumexp(
+                    view_log_probabilities, dim=1,
+                ) - math.log(views)
+                loss = F.nll_loss(log_probabilities, labels)
+                predicted = log_probabilities.argmax(dim=1)
+            else:
+                raise ValueError(
+                    "Validation expects [B,C,T,H,W] or [B,V,C,T,H,W], "
+                    f"got {tuple(clips.shape)}"
+                )
 
-        predicted = logits.argmax(dim=1)
         batch_size = labels.size(0)
         total_loss += loss.item() * batch_size
         total_samples += batch_size

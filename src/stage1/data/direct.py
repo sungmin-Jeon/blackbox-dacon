@@ -9,7 +9,16 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from inference import _clip_ids, _decode_stage1_clip, _spatial_config, _spatial_cache_tag
+from inference import (
+    _decode_stage1_clip,
+    _spatial_config,
+    _spatial_cache_tag,
+    _temporal_cache_tag,
+    _temporal_clip_ids,
+    _temporal_config,
+    _temporal_eval_views,
+    _validate_temporal_frames,
+)
 
 
 LABEL_TO_INDEX = {
@@ -54,6 +63,7 @@ class DirectStage1Dataset(Dataset):
         size: int = 224,
         cache_dir: str | Path | None = None,
         spatial: dict | None = None,
+        temporal: dict | None = None,
     ) -> None:
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")
@@ -72,6 +82,8 @@ class DirectStage1Dataset(Dataset):
         self.frames = frames
         self.size = size
         self.spatial = _spatial_config(**(spatial or {}))
+        self.temporal = _temporal_config(**(temporal or {}))
+        _validate_temporal_frames(self.frames, self.temporal)
         self.cache_dir = (
             Path(cache_dir).expanduser().resolve()
             if cache_dir is not None
@@ -143,12 +155,20 @@ class DirectStage1Dataset(Dataset):
     def _cache_path(self, sample: dict) -> Path | None:
         if self.cache_dir is None:
             return None
-        # Caching the final crop would freeze random augmentation after one draw.
-        if self.split == "train" and self.spatial["mode"] == "random":
+        # Caching would freeze either random spatial or temporal augmentation.
+        if self.split == "train" and (
+            self.spatial["mode"] == "random"
+            or self.temporal["mode"] != "uniform"
+        ):
             return None
         spatial_root = self.cache_dir
         if self.spatial["mode"] != "center":
             spatial_root = spatial_root / _spatial_cache_tag(self.spatial)
+        if not (
+            self.temporal["mode"] == "uniform"
+            and self.temporal["eval_mode"] == "uniform"
+        ):
+            spatial_root = spatial_root / _temporal_cache_tag(self.temporal)
         return (
             spatial_root
             / f"frames_{self.frames}_size_{self.size}"
@@ -157,11 +177,26 @@ class DirectStage1Dataset(Dataset):
         )
 
     def _decode(self, path: Path) -> torch.Tensor:
-        frame_ids = _clip_ids(path, self.frames, slot=0, slots=1)
-        return _decode_stage1_clip(
-            path, self.size, frame_ids, spatial=self.spatial,
-            training=self.split == "train",
-        )
+        training = self.split == "train"
+        if training:
+            frame_ids = _temporal_clip_ids(
+                path, self.frames, temporal=self.temporal, training=True,
+            )
+            return _decode_stage1_clip(
+                path, self.size, frame_ids, spatial=self.spatial, training=True,
+            )
+
+        clips = []
+        for view in _temporal_eval_views(self.temporal):
+            frame_ids = _temporal_clip_ids(
+                path, self.frames, temporal=self.temporal, view=view,
+            )
+            clips.append(
+                _decode_stage1_clip(
+                    path, self.size, frame_ids, spatial=self.spatial,
+                )
+            )
+        return clips[0] if len(clips) == 1 else torch.stack(clips)
 
     def _load_clip(self, sample: dict) -> torch.Tensor:
         cache_path = self._cache_path(sample)

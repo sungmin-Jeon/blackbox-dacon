@@ -42,6 +42,7 @@ def _video_paths(root: Path):
 # Stage 1: MViTv2-S replay classifier
 # ---------------------------------------------------------------------------
 def _clip_ids(path: Path, frames: int, slot: int, slots: int):
+    """Legacy clip selection retained for old callers and checkpoints."""
     capture = cv2.VideoCapture(str(path))
     total = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
     capture.release()
@@ -50,6 +51,143 @@ def _clip_ids(path: Path, frames: int, slot: int, slots: int):
     center = (slot + 0.5) * total / slots
     start = max(0, min(total - frames, round(center - frames / 2)))
     return np.linspace(start, min(total - 1, start + frames - 1), frames).round().astype(int)
+
+
+TEMPORAL_VERSION = 1
+TEMPORAL_TRAIN_MODES = ("uniform", "multi-burst", "mixed")
+TEMPORAL_EVAL_MODES = ("uniform", "multi-burst", "both")
+
+
+def _temporal_config(mode="uniform", eval_mode="auto", bursts=4,
+                     version=TEMPORAL_VERSION):
+    """Versioned Stage 1 temporal sampling configuration.
+
+    ``mode`` controls Direct training. ``eval_mode`` controls validation and
+    submission; ``both`` averages a global-uniform and a multi-burst view.
+    Old checkpoints resolve to one uniform view.
+    """
+    if mode not in TEMPORAL_TRAIN_MODES:
+        raise ValueError(f"Unknown temporal training mode: {mode}")
+    if eval_mode in (None, "auto"):
+        eval_mode = {
+            "uniform": "uniform",
+            "multi-burst": "multi-burst",
+            "mixed": "both",
+        }[mode]
+    if eval_mode not in TEMPORAL_EVAL_MODES:
+        raise ValueError(f"Unknown temporal evaluation mode: {eval_mode}")
+    if bursts < 1:
+        raise ValueError("temporal bursts must be at least one")
+    if version != TEMPORAL_VERSION:
+        raise ValueError(f"Unsupported temporal preprocessing version: {version}")
+    return dict(mode=mode, eval_mode=eval_mode, bursts=int(bursts), version=version)
+
+
+def _stage1_temporal_config(checkpoint):
+    """Restore temporal settings while keeping old checkpoints unchanged."""
+    return _temporal_config(**checkpoint.get("config", {}).get("temporal", {}))
+
+
+def _temporal_eval_views(temporal):
+    options = _temporal_config(**(temporal or {}))
+    if options["eval_mode"] == "both":
+        return ("uniform", "multi-burst")
+    return (options["eval_mode"],)
+
+
+def _validate_temporal_frames(frames, temporal):
+    """Validate frame-count-dependent temporal settings before decoding."""
+    options = _temporal_config(**(temporal or {}))
+    frames = int(frames)
+    if frames < 1:
+        raise ValueError("frames must be at least one")
+    uses_multi_burst = (
+        options["mode"] in {"multi-burst", "mixed"}
+        or options["eval_mode"] in {"multi-burst", "both"}
+    )
+    if uses_multi_burst and frames % options["bursts"]:
+        raise ValueError(
+            f"frames={frames} must be divisible by temporal bursts={options['bursts']}"
+        )
+    return options
+
+
+def _temporal_cache_tag(temporal):
+    temporal = _temporal_config(**temporal)
+    digest = hashlib.sha256(json.dumps(temporal, sort_keys=True).encode()).hexdigest()[:16]
+    return f"temporal_v{TEMPORAL_VERSION}_{temporal['mode']}_{temporal['eval_mode']}_{digest}"
+
+
+def _temporal_frame_ids(total, frames, *, mode="uniform", bursts=4,
+                        training=False):
+    """Select one chronological Stage 1 view from a known frame count.
+
+    Multi-burst splits the whole video into ``bursts`` segments and takes a
+    consecutive burst inside each segment. Training jitters each burst start;
+    evaluation uses the centered start. Empty/short segments repeat valid
+    indices so the output length remains exactly ``frames``.
+    """
+    total = max(1, int(total))
+    frames = int(frames)
+    bursts = int(bursts)
+    if frames < 1:
+        raise ValueError("frames must be at least one")
+    if bursts < 1:
+        raise ValueError("temporal bursts must be at least one")
+
+    if mode == "mixed":
+        if not training:
+            raise ValueError("mixed temporal sampling is training-only")
+        mode = "uniform" if int(np.random.randint(2)) == 0 else "multi-burst"
+    if mode == "uniform":
+        return np.linspace(0, total - 1, frames).round().astype(int)
+    if mode != "multi-burst":
+        raise ValueError(f"Unknown temporal view: {mode}")
+    if frames % bursts:
+        raise ValueError(
+            f"frames={frames} must be divisible by temporal bursts={bursts}"
+        )
+
+    frames_per_burst = frames // bursts
+    boundaries = np.linspace(0, total, bursts + 1).astype(int)
+    selected = []
+    for burst_index in range(bursts):
+        first = int(boundaries[burst_index])
+        stop = int(boundaries[burst_index + 1])
+        segment_length = stop - first
+
+        if segment_length >= frames_per_burst:
+            latest_start = stop - frames_per_burst
+            if training:
+                start = int(np.random.randint(first, latest_start + 1))
+            else:
+                start = first + (segment_length - frames_per_burst) // 2
+            burst_ids = np.arange(start, start + frames_per_burst, dtype=int)
+        elif segment_length > 0:
+            burst_ids = np.linspace(
+                first, stop - 1, frames_per_burst
+            ).round().astype(int)
+        else:
+            midpoint = round((burst_index + 0.5) * total / bursts - 0.5)
+            burst_ids = np.full(
+                frames_per_burst, np.clip(midpoint, 0, total - 1), dtype=int
+            )
+        selected.append(burst_ids)
+
+    return np.concatenate(selected).astype(int)
+
+
+def _temporal_clip_ids(path: Path, frames: int, *, temporal=None,
+                       training=False, view=None):
+    """Read a video's frame count and select one configured temporal view."""
+    options = _temporal_config(**(temporal or {}))
+    mode = options["mode"] if view is None else view
+    capture = cv2.VideoCapture(str(path))
+    total = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    capture.release()
+    return _temporal_frame_ids(
+        total, frames, mode=mode, bursts=options["bursts"], training=training,
+    )
 
 
 SPATIAL_VERSION = 1
@@ -207,12 +345,25 @@ def _decode_stage1_clip(path: Path, size: int, frame_ids, *, spatial=None,
 
 
 class _Stage1Clips(Dataset):
-    def __init__(self, videos, slots: int, size: int, frames: int, spatial=None) -> None:
+    def __init__(self, videos, slots: int, size: int, frames: int, spatial=None,
+                 temporal=None) -> None:
         self.videos = videos
         self.slots = slots
         self.size = size
         self.frames = frames
         self.spatial = _spatial_config(**(spatial or {}))
+        self.temporal = (
+            _temporal_config(**temporal) if temporal is not None else None
+        )
+        self.temporal_views = (
+            _temporal_eval_views(self.temporal) if self.temporal is not None else None
+        )
+        if self.temporal is not None:
+            _validate_temporal_frames(self.frames, self.temporal)
+        if self.temporal_views is not None and self.slots != len(self.temporal_views):
+            raise ValueError(
+                f"slots={slots} does not match temporal views={self.temporal_views}"
+            )
 
     def __len__(self) -> int:
         return len(self.videos) * self.slots
@@ -221,8 +372,16 @@ class _Stage1Clips(Dataset):
         video_index, slot = index // self.slots, index % self.slots
         path = self.videos[video_index]
         try:
-            clip = _decode_stage1_clip(path, self.size, _clip_ids(path, self.frames, slot, self.slots),
-                                       spatial=self.spatial)
+            if self.temporal_views is None:
+                frame_ids = _clip_ids(path, self.frames, slot, self.slots)
+            else:
+                frame_ids = _temporal_clip_ids(
+                    path, self.frames, temporal=self.temporal,
+                    view=self.temporal_views[slot],
+                )
+            clip = _decode_stage1_clip(
+                path, self.size, frame_ids, spatial=self.spatial,
+            )
             valid = 1
         except Exception:
             clip = torch.zeros(3, self.frames, self.size, self.size)
@@ -241,9 +400,11 @@ def predict_stage1(data_dir, model_dir):
     model.to(device).eval()
 
     videos = _video_paths(Path(data_dir) / "videos")
-    # Match Baidu training: sample one 16-frame clip uniformly over the video.
-    slots = 1
-    dataset = _Stage1Clips(videos, slots, size, frames, _stage1_spatial_config(checkpoint))
+    temporal = _stage1_temporal_config(checkpoint)
+    slots = len(_temporal_eval_views(temporal))
+    dataset = _Stage1Clips(
+        videos, slots, size, frames, _stage1_spatial_config(checkpoint), temporal,
+    )
     loader = DataLoader(dataset, batch_size=4, num_workers=4, pin_memory=True)
     scores = [[] for _ in videos]
 

@@ -67,6 +67,47 @@ When initializing from an existing Stage 1 checkpoint, choose how much of the
 MViT to update with `--fine-tune-scope`: `full` (default), `head`, or
 `last-block` (the final MViT block, final norm, and classification head).
 
+## Direct temporal-view experiments (Colab)
+
+Temporal sampling is versioned in the checkpoint and shared by Direct
+training, validation, `eval_stage1.py`, and submission inference. Old
+checkpoints have no temporal configuration and retain the original single
+uniform view exactly.
+
+| Training option | Behavior |
+| --- | --- |
+| `--temporal-mode uniform` | Select 16 frames uniformly across the full video (legacy default). |
+| `--temporal-mode multi-burst` | Split the video into four segments and select four consecutive frames per segment. Training jitters each burst start; validation is centered and deterministic. |
+| `--temporal-mode mixed` | Randomly use uniform or jittered multi-burst for each training sample. |
+
+`--temporal-eval-mode auto` follows the training mode: uniform evaluates one
+uniform view, multi-burst evaluates one centered multi-burst view, and mixed
+evaluates both views and averages their probabilities. Override it with
+`uniform`, `multi-burst`, or `both`. The `both` setting runs MViT twice per
+video. `--frames` must be divisible by `--temporal-bursts` whenever a
+multi-burst view is used. The recommended first ablation keeps the center crop
+and all other settings fixed:
+
+```python
+%cd /content/blackbox-dacon
+!python train_stage1.py \
+  --dataset direct \
+  --split-csv "/content/drive/MyDrive/2026_Dacon/sungmin/stage1/data/stage1_split.csv" \
+  --video-root "/content/direct_stage1" \
+  --model-dir "/content/drive/MyDrive/2026_Dacon/sungmin/stage1/direct_v0_multiburst_v1" \
+  --cache-dir "/content/stage1_temporal_cache" \
+  --temporal-mode multi-burst --temporal-bursts 4 \
+  --spatial-mode center \
+  --frames 16 --size 224 --epochs 30 --batch-size 2 \
+  --lr 1e-5 --seed 42 --early-stopping-patience 5
+```
+
+After the single-view ablation, train a model that accepts both views with
+`--temporal-mode mixed --temporal-eval-mode both`. Randomized training clips
+are intentionally not cached. Deterministic validation clips can be cached,
+and their cache keys include the full temporal configuration. Offline
+evaluation CSVs include each view's probability as well as their mean.
+
 ## Direct v0 spatial-selection experiments (Colab)
 
 The model and uniform 16-frame temporal sampling stay unchanged. One crop

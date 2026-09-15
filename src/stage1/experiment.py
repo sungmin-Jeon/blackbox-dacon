@@ -7,7 +7,14 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from inference import SPATIAL_MODES, _spatial_config
+from inference import (
+    SPATIAL_MODES,
+    TEMPORAL_EVAL_MODES,
+    TEMPORAL_TRAIN_MODES,
+    _spatial_config,
+    _temporal_config,
+    _validate_temporal_frames,
+)
 
 from src.common.runtime import default_device, set_seed
 from src.stage1.checkpoint import append_metrics, save_checkpoint, save_config
@@ -57,6 +64,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--frames", type=int, default=16)
     parser.add_argument("--size", type=int, default=224)
+    parser.add_argument(
+        "--temporal-mode",
+        choices=TEMPORAL_TRAIN_MODES,
+        default="uniform",
+        help="Direct only: uniform, four-segment multi-burst, or a training mixture",
+    )
+    parser.add_argument(
+        "--temporal-eval-mode",
+        choices=("auto",) + TEMPORAL_EVAL_MODES,
+        default="auto",
+        help="Validation/submission view: auto follows training, or choose one/both",
+    )
+    parser.add_argument(
+        "--temporal-bursts",
+        type=int,
+        default=4,
+        help="Number of segments used by multi-burst; --frames must be divisible by it",
+    )
     parser.add_argument("--spatial-mode", choices=SPATIAL_MODES, default="center",
                         help="Direct only: legacy center, native-center, random or FFT crop")
     parser.add_argument("--crop-size", type=int, default=224,
@@ -118,6 +143,11 @@ def _resolved_config(args: argparse.Namespace) -> dict:
         mode=args.spatial_mode, crop_size=args.crop_size,
         grid_size=args.crop_grid, seed=args.seed, fft_min_freq=args.fft_min_freq,
     )
+    config["temporal"] = _temporal_config(
+        mode=args.temporal_mode,
+        eval_mode=args.temporal_eval_mode,
+        bursts=args.temporal_bursts,
+    )
     for name in (
         "data_dir",
         "model_dir",
@@ -160,6 +190,7 @@ def _build_dataloaders(args: argparse.Namespace) -> tuple:
         seed=args.seed,
         balanced_sampling=args.balanced_sampling,
         spatial=_resolved_config(args)["spatial"],
+        temporal=_resolved_config(args)["temporal"],
     )
 
 
@@ -226,6 +257,16 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("early_stopping_patience cannot be negative")
     if args.dataset != "direct" and args.spatial_mode != "center":
         raise ValueError("Spatial crop experiments currently require --dataset direct")
+    temporal = _temporal_config(
+        mode=args.temporal_mode,
+        eval_mode=args.temporal_eval_mode,
+        bursts=args.temporal_bursts,
+    )
+    if args.dataset != "direct" and (
+        temporal["mode"] != "uniform" or temporal["eval_mode"] != "uniform"
+    ):
+        raise ValueError("Temporal sampling experiments currently require --dataset direct")
+    _validate_temporal_frames(args.frames, temporal)
     config = _resolved_config(args)
 
     model_dir = args.model_dir.expanduser().resolve()
@@ -266,9 +307,12 @@ def run(args: argparse.Namespace) -> Path:
 
     print(f"device: {device}")
     print(f"dataset: {args.dataset}")
+    print(f"temporal sampling: {config['temporal']}")
     print(f"spatial preprocessing: {config['spatial']}")
     if args.spatial_mode == "random" and args.cache_dir is not None:
         print("Random TRAIN crops are not cached; validation crops use a fixed filename/seed.")
+    if args.temporal_mode != "uniform" and args.cache_dir is not None:
+        print("Augmented TRAIN temporal clips are not cached; validation clips are deterministic.")
     if args.dataset == "baidu":
         print(f"data: {args.data_dir.expanduser().resolve()}")
     else:

@@ -15,7 +15,7 @@ import torch
 from inference import (
     S1_MEAN, S1_STD, _crop_candidates, _decode_stage1_clip,
     _fft_patch_score, _spatial_config, _stage1_spatial_config, _Stage1Clips,
-    _spatial_cache_tag,
+    _spatial_cache_tag, _stage1_temporal_config, _temporal_config,
 )
 from eval_stage1 import Stage1VideoDataset
 from src.stage1.data.build import build_direct_dataloaders
@@ -124,6 +124,7 @@ class SpatialTests(unittest.TestCase):
         checkpoint = torch.load(path, weights_only=False)
         self.assertEqual(_stage1_spatial_config(checkpoint),
                          _spatial_config(mode="fft", crop_size=32, grid_size=3))
+        self.assertEqual(_stage1_temporal_config(checkpoint), _temporal_config())
         last = torch.load(path.parent / "last.pt", weights_only=False)
         self.assertEqual(_stage1_spatial_config(last), _stage1_spatial_config(checkpoint))
         self.assertIn("optimizer", last)

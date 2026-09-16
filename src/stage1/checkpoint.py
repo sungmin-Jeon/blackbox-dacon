@@ -84,6 +84,7 @@ def save_checkpoint(
     size: int,
     frames: int,
     val_macro_f1: float,
+    val_loss: float,
     config: dict[str, Any],
 ) -> Path:
     """Save a checkpoint compatible with inference.predict_stage1."""
@@ -98,6 +99,7 @@ def save_checkpoint(
         "size": size,
         "frames": frames,
         "val_macro_f1": val_macro_f1,
+        "val_loss": val_loss,
         "class_to_label": {
             "ORIGINAL": 0,
             "RERECORDED": 1,

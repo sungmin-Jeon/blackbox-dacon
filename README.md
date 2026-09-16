@@ -60,8 +60,11 @@ write checkpoints and metrics to Google Drive:
   --lr 1e-4
 ```
 
-The run saves `best.pt` by validation Macro-F1, `last.pt`, `metrics.csv`, and
-`config.json`. Use a new `--model-dir` for every experiment.
+The run saves `best.pt` by validation Macro-F1, `best_loss.pt` by validation
+loss, `last.pt`, `metrics.csv`, and `config.json`. Early stopping monitors
+Macro-F1 by default; pass `--early-stopping-monitor val-loss` to use validation
+loss without changing which checkpoints are retained. Use a new `--model-dir`
+for every experiment.
 
 When initializing from an existing Stage 1 checkpoint, choose how much of the
 MViT to update with `--fine-tune-scope`: `full` (default), `head`, or
@@ -91,7 +94,8 @@ The clean ablation from the strongest uniform/center setup is:
   --aug-flip-probability 0.5 \
   --aug-brightness 0.1 --aug-contrast 0.1 --aug-saturation 0.1 \
   --frames 16 --size 224 --epochs 30 --batch-size 2 \
-  --num-workers 2 --lr 1e-5 --seed 42 --early-stopping-patience 7
+  --num-workers 2 --lr 1e-5 --seed 42 \
+  --early-stopping-monitor val-loss --early-stopping-patience 7
 ```
 
 The defaults shown above are intentionally weak. Apply them identically to

@@ -109,7 +109,8 @@ class SpatialTests(unittest.TestCase):
         argv = ["train_stage1.py", "--dataset", "direct", "--split-csv", str(manifest),
                 "--model-dir", str(self.root / "run"), "--epochs", "1",
                 "--num-workers", "0", "--size", "32", "--spatial-mode", "fft",
-                "--crop-size", "32", "--crop-grid", "3", "--no-pretrained", "--no-amp"]
+                "--crop-size", "32", "--crop-grid", "3", "--no-pretrained", "--no-amp",
+                "--early-stopping-monitor", "val-loss"]
         with patch("sys.argv", argv):
             args = parse_args()
         # Exercise optimizer, train/val loop and real checkpoint writer without
@@ -121,10 +122,15 @@ class SpatialTests(unittest.TestCase):
         with patch("src.stage1.experiment._build_model", return_value=(model, None)), \
              contextlib.redirect_stdout(io.StringIO()):
             path = run(args)
+        self.assertEqual(path.name, "best_loss.pt")
         checkpoint = torch.load(path, weights_only=False)
+        self.assertIn("val_loss", checkpoint)
         self.assertEqual(_stage1_spatial_config(checkpoint),
                          _spatial_config(mode="fft", crop_size=32, grid_size=3))
         self.assertEqual(_stage1_temporal_config(checkpoint), _temporal_config())
+        best_f1 = torch.load(path.parent / "best.pt", weights_only=False)
+        self.assertNotIn("optimizer", best_f1)
+        self.assertIn("val_loss", best_f1)
         last = torch.load(path.parent / "last.pt", weights_only=False)
         self.assertEqual(_stage1_spatial_config(last), _stage1_spatial_config(checkpoint))
         self.assertIn("optimizer", last)

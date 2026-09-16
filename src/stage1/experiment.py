@@ -117,7 +117,16 @@ def parse_args() -> argparse.Namespace:
         "--early-stopping-patience",
         type=int,
         default=5,
-        help="Stop after this many non-improving epochs; zero disables it",
+        help="Stop after this many non-improving monitored epochs; zero disables it",
+    )
+    parser.add_argument(
+        "--early-stopping-monitor",
+        choices=("macro-f1", "val-loss"),
+        default="macro-f1",
+        help=(
+            "Metric used to reset early-stopping patience; best.pt and "
+            "best_loss.pt are saved regardless of this choice"
+        ),
     )
     parser.add_argument(
         "--pretrained",
@@ -380,9 +389,12 @@ def run(args: argparse.Namespace) -> Path:
         f"({trainable_parameters / total_parameters:.2%})"
     )
     print(f"amp: {amp_enabled}")
+    print(f"early stopping monitor: {args.early_stopping_monitor}")
 
-    best_score = float("-inf")
+    best_f1 = float("-inf")
+    best_val_loss = float("inf")
     best_path = model_dir / "best.pt"
+    best_loss_path = model_dir / "best_loss.pt"
     epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -423,13 +435,13 @@ def run(args: argparse.Namespace) -> Path:
             size=args.size,
             frames=args.frames,
             val_macro_f1=score,
+            val_loss=validation.loss,
             config=config,
         )
 
-        improved = score > best_score
-        if improved:
-            best_score = score
-            epochs_without_improvement = 0
+        f1_improved = score > best_f1
+        if f1_improved:
+            best_f1 = score
             save_checkpoint(
                 best_path,
                 model=model,
@@ -439,8 +451,32 @@ def run(args: argparse.Namespace) -> Path:
                 size=args.size,
                 frames=args.frames,
                 val_macro_f1=score,
+                val_loss=validation.loss,
                 config=config,
             )
+
+        loss_improved = validation.loss < best_val_loss
+        if loss_improved:
+            best_val_loss = validation.loss
+            save_checkpoint(
+                best_loss_path,
+                model=model,
+                optimizer=None,
+                epoch=epoch,
+                size=args.size,
+                frames=args.frames,
+                val_macro_f1=score,
+                val_loss=validation.loss,
+                config=config,
+            )
+
+        monitor_improved = (
+            f1_improved
+            if args.early_stopping_monitor == "macro-f1"
+            else loss_improved
+        )
+        if monitor_improved:
+            epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
 
@@ -456,17 +492,27 @@ def run(args: argparse.Namespace) -> Path:
             f"pred_ratio O/R "
             f"{metrics.predicted_original_ratio:.3f}/"
             f"{metrics.predicted_rerecorded_ratio:.3f}"
-            f"{' | best' if improved else ''}"
+            f"{' | best_f1' if f1_improved else ''}"
+            f"{' | best_loss' if loss_improved else ''}"
         )
 
         patience = args.early_stopping_patience
         if patience and epochs_without_improvement >= patience:
-            print(f"early stopping after {patience} non-improving epochs")
+            print(
+                f"early stopping after {patience} non-improving "
+                f"{args.early_stopping_monitor} epochs"
+            )
             break
 
-    print(f"best Macro-F1: {best_score:.4f}")
-    print(f"best checkpoint: {best_path}")
-    return best_path
+    selected_path = (
+        best_path
+        if args.early_stopping_monitor == "macro-f1"
+        else best_loss_path
+    )
+    print(f"best Macro-F1: {best_f1:.4f} ({best_path})")
+    print(f"best validation loss: {best_val_loss:.4f} ({best_loss_path})")
+    print(f"selected checkpoint: {selected_path}")
+    return selected_path
 
 
 def main() -> None:

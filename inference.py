@@ -466,7 +466,7 @@ def predict_stage1(data_dir, model_dir):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: ResNet18 + BiGRU
+# Stage 2: frozen ResNet18 + collision-only BiGRU V0
 # ---------------------------------------------------------------------------
 class _Stage2Frames(Dataset):
     def __init__(self, paths, transform) -> None:
@@ -481,23 +481,29 @@ class _Stage2Frames(Dataset):
             return self.transform(image.convert("RGB"))
 
 
-class _Stage2Temporal(nn.Module):
-    def __init__(self) -> None:
+class _Stage2CollisionBiGRU(nn.Module):
+    def __init__(
+        self,
+        input_size: int = 512,
+        hidden_size: int = 192,
+        num_layers: int = 2,
+        dropout: float = 0.3,
+    ) -> None:
         super().__init__()
-        self.r = nn.GRU(512, 192, 2, batch_first=True, bidirectional=True, dropout=0.15)
-        self.tc = nn.Linear(384, 1)
-        self.te = nn.Linear(384, 1)
-        self.scene = nn.Sequential(nn.Linear(768, 192), nn.ReLU(), nn.Dropout(0.2), nn.Linear(192, 4))
+        self.gru = nn.GRU(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.collision_head = nn.Linear(hidden_size * 2, 1)
 
     def forward(self, inputs: torch.Tensor):
-        hidden, _ = self.r(inputs)
-        collision_logits = self.tc(hidden).squeeze(-1)
-        entry_logits = self.te(hidden).squeeze(-1)
-        collision_index = collision_logits.argmax(1)
-        entry_index = entry_logits.argmax(1)
-        batch = torch.arange(len(hidden), device=hidden.device)
-        scene_input = torch.cat([hidden[batch, collision_index], hidden[batch, entry_index]], 1)
-        return collision_index, entry_index, self.scene(scene_input)
+        hidden, _ = self.gru(inputs)
+        return self.collision_head(self.dropout(hidden)).squeeze(-1)
 
 
 def _frame_number(path: Path) -> int:
@@ -508,6 +514,8 @@ def _frame_number(path: Path) -> int:
 def predict_stage2(data_dir, model_dir):
     device = _device()
     model_dir = Path(model_dir)
+
+    # Match the center-crop ImageNet preprocessing used to build the V0 cache.
     transform = ResNet18_Weights.IMAGENET1K_V1.transforms()
     backbone = resnet18(weights=None)
     backbone.load_state_dict(
@@ -516,9 +524,15 @@ def predict_stage2(data_dir, model_dir):
     backbone.fc = nn.Identity()
     backbone.to(device).eval()
 
-    temporal = _Stage2Temporal()
-    temporal.load_state_dict(torch.load(model_dir / "best.pt", map_location="cpu", weights_only=False)["model"])
-    temporal.to(device).eval()
+    checkpoint = torch.load(model_dir / "best.pt", map_location="cpu", weights_only=False)
+    collision_model = _Stage2CollisionBiGRU(
+        input_size=int(checkpoint.get("input_size", 512)),
+        hidden_size=int(checkpoint.get("hidden_size", 192)),
+        num_layers=int(checkpoint.get("num_layers", 2)),
+        dropout=float(checkpoint.get("dropout", 0.3)),
+    )
+    collision_model.load_state_dict(checkpoint["model_state_dict"])
+    collision_model.to(device).eval()
 
     folders = sorted(path for path in (Path(data_dir) / "images").iterdir() if path.is_dir())
     rows = []
@@ -534,23 +548,25 @@ def predict_stage2(data_dir, model_dir):
             loader = DataLoader(_Stage2Frames(paths, transform), batch_size=256, num_workers=6, pin_memory=True)
             features = []
             for images in loader:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    features.append(backbone(images.to(device, non_blocking=True)).float().cpu())
+                # V0 training features were extracted in FP32, so inference uses FP32 too.
+                features.append(backbone(images.to(device, non_blocking=True)).cpu())
 
             sequence = torch.cat(features)[None].to(device)
-            collision_index, entry_index, scene = temporal(sequence)
+            collision_logits = collision_model(sequence)
+            collision_index = int(collision_logits.argmax(1).item())
             frame_numbers = [_frame_number(path) for path in paths]
             rows.append(
                 {
                     "ID": folder.name,
-                    "collision_frame": frame_numbers[int(collision_index)],
-                    "entry_frame": frame_numbers[int(entry_index)],
-                    "evasion_space": int(scene[:, :2].argmax(1)),
-                    "entry_side": "RIGHT" if int(scene[:, 2:].argmax(1)) else "LEFT",
+                    "collision_frame": frame_numbers[collision_index],
+                    # Valid deterministic placeholders until the remaining heads are trained.
+                    "entry_frame": frame_numbers[0],
+                    "evasion_space": 0,
+                    "entry_side": "LEFT",
                 }
             )
 
-    del backbone, temporal
+    del backbone, collision_model
     torch.cuda.empty_cache()
     return pd.DataFrame(rows, columns=["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"])
 

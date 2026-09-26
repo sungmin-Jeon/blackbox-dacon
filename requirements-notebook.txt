@@ -1,0 +1,9 @@
+# Local WSL notebook environment for data inspection and labeling preparation.
+# Competition inference dependencies remain in requirements.txt.
+jupyterlab>=4.2,<5
+ipykernel>=6.29,<7
+matplotlib>=3.9,<4
+numpy==2.1.2
+pandas==2.2.3
+opencv-python==4.10.0.84
+tqdm==4.66.5

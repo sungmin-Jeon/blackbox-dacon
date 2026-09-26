@@ -72,6 +72,7 @@ class Stage2Labeler:
         frame_number_base: int = 1,
         neighborhood_radius: int = 2,
         initial_video_id: str | None = None,
+        include_collision: bool = True,
     ) -> None:
         try:
             import cv2
@@ -98,6 +99,7 @@ class Stage2Labeler:
         self.evidence_dir = Path(evidence_dir) if evidence_dir else self.csv_path.parent / "evidence"
         self.frame_number_base = frame_number_base
         self.neighborhood_radius = max(1, int(neighborhood_radius))
+        self.include_collision = bool(include_collision)
 
         self.videos = sorted(
             path
@@ -220,16 +222,22 @@ class Stage2Labeler:
             w.HBox([self.mark_buttons["collision_min"], self.mark_buttons["collision_frame"], self.mark_buttons["collision_max"]]),
             w.HBox([self.mark_labels["collision_min"], self.mark_labels["collision_frame"], self.mark_labels["collision_max"]]),
         ])
-        self.ui = w.VBox([
+        annotation_widgets = [
             w.HBox([self.video_select, self.overview_button]),
             w.HBox([self.prev5, self.prev1, self.slider, self.next1, self.next5]),
             self.frame_output,
             entry_box,
-            collision_box,
+        ]
+        if self.include_collision:
+            annotation_widgets.append(collision_box)
+        annotation_widgets.extend([
             self.entry_side,
             self.evasion_space,
             self.entry_confidence,
-            self.collision_confidence,
+        ])
+        if self.include_collision:
+            annotation_widgets.append(self.collision_confidence)
+        annotation_widgets.extend([
             self.lane_basis,
             self.status,
             self.notes,
@@ -237,6 +245,7 @@ class Stage2Labeler:
             self.message,
             self.overview_output,
         ])
+        self.ui = w.VBox(annotation_widgets)
 
     def show(self) -> None:
         self._display(self.ui)
@@ -384,21 +393,30 @@ class Stage2Labeler:
         if self.status.value == "SKIP":
             return None
         entry = [self._marks["entry_min"], self._marks["entry_frame"], self._marks["entry_max"]]
-        collision = [self._marks["collision_min"], self._marks["collision_frame"], self._marks["collision_max"]]
-        if any(value is None for value in entry + collision):
-            return "진입·충돌의 min/best/max를 모두 지정하세요. 판단 불가 영상은 SKIP으로 저장하세요."
+        if any(value is None for value in entry):
+            return "진입의 min/best/max를 모두 지정하세요. 판단 불가 영상은 SKIP으로 저장하세요."
         if not self._ordered(entry):
             return "진입 프레임은 min ≤ best ≤ max여야 합니다."
-        if not self._ordered(collision):
-            return "충돌 프레임은 min ≤ best ≤ max여야 합니다."
-        if self._marks["entry_frame"] > self._marks["collision_frame"]:  # type: ignore[operator]
-            return "진입 대표 프레임이 충돌 대표 프레임보다 늦습니다. 영상을 재확인하세요."
+        if self.include_collision:
+            collision = [
+                self._marks["collision_min"],
+                self._marks["collision_frame"],
+                self._marks["collision_max"],
+            ]
+            if any(value is None for value in collision):
+                return "충돌의 min/best/max를 모두 지정하세요. 판단 불가 영상은 SKIP으로 저장하세요."
+            if not self._ordered(collision):
+                return "충돌 프레임은 min ≤ best ≤ max여야 합니다."
+            if self._marks["entry_frame"] > self._marks["collision_frame"]:  # type: ignore[operator]
+                return "진입 대표 프레임이 충돌 대표 프레임보다 늦습니다. 영상을 재확인하세요."
         if self.entry_side.value not in {"LEFT", "RIGHT"}:
             return "진입 방향을 선택하세요."
         if self.evasion_space.value not in {0, 1}:
             return "회피 공간 0/1을 선택하세요."
-        if not self.entry_confidence.value or not self.collision_confidence.value:
-            return "진입·충돌 확신도를 선택하세요."
+        if not self.entry_confidence.value:
+            return "진입 확신도를 선택하세요."
+        if self.include_collision and not self.collision_confidence.value:
+            return "충돌 확신도를 선택하세요."
         if not self.lane_basis.value:
             return "차선 기준을 선택하세요."
         return None
@@ -419,18 +437,22 @@ class Stage2Labeler:
             "entry_side": "" if skipped else self.entry_side.value,
             "evasion_space": "" if skipped else self.evasion_space.value,
             "entry_confidence": "" if skipped else self.entry_confidence.value,
-            "collision_confidence": "" if skipped else self.collision_confidence.value,
+            "collision_confidence": (
+                "" if skipped or not self.include_collision else self.collision_confidence.value
+            ),
             "lane_basis": "" if skipped else self.lane_basis.value,
             "status": self.status.value,
             "notes": self.notes.value.strip(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         for key in self._marks:
-            row[key] = "" if skipped or self._marks[key] is None else self._marks[key]
+            excluded = key.startswith("collision_") and not self.include_collision
+            row[key] = "" if skipped or excluded or self._marks[key] is None else self._marks[key]
         for prefix in ("entry", "collision"):
-            row[f"{prefix}_time"] = "" if skipped else self._time(f"{prefix}_frame")
-            row[f"{prefix}_min_time"] = "" if skipped else self._time(f"{prefix}_min")
-            row[f"{prefix}_max_time"] = "" if skipped else self._time(f"{prefix}_max")
+            excluded = prefix == "collision" and not self.include_collision
+            row[f"{prefix}_time"] = "" if skipped or excluded else self._time(f"{prefix}_frame")
+            row[f"{prefix}_min_time"] = "" if skipped or excluded else self._time(f"{prefix}_min")
+            row[f"{prefix}_max_time"] = "" if skipped or excluded else self._time(f"{prefix}_max")
         return {column: row.get(column, "") for column in CSV_COLUMNS}
 
     def _write_csv(self, row: dict[str, Any]) -> None:
@@ -462,7 +484,8 @@ class Stage2Labeler:
         self._write_csv(row)
         if self.status.value != "SKIP":
             self._save_evidence("entry", self._marks["entry_frame"])
-            self._save_evidence("collision", self._marks["collision_frame"])
+            if self.include_collision:
+                self._save_evidence("collision", self._marks["collision_frame"])
         self.message.value = (
             f"<span style='color:green'><b>저장 완료:</b> {self.csv_path}<br>"
             f"평가 허용 반경은 이 영상에서 ±{tolerance_radius_frames(self.fps)}프레임이며, "
@@ -473,4 +496,3 @@ class Stage2Labeler:
         options = list(self._video_by_id)
         index = options.index(self.video_select.value)
         self.video_select.value = options[(index + 1) % len(options)]
-

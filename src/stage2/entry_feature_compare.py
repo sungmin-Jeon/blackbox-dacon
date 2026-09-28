@@ -26,6 +26,50 @@ from src.stage2.losses import make_temporal_loss
 
 
 FEATURE_NAMES = ("global_center", "spatial_layer3", "spatial_layer4")
+SIDE_TO_INDEX = {"LEFT": 0, "RIGHT": 1}
+
+
+class EntrySideFeatureModel(CollisionFeatureModel):
+    """Use Entry temporal attention to classify the other vehicle's side."""
+
+    def __init__(self, *, entry_temperature: float = 1.0, **kwargs: Any) -> None:
+        if entry_temperature <= 0:
+            raise ValueError("entry_temperature must be positive")
+        super().__init__(**kwargs)
+        self.entry_temperature = entry_temperature
+        hidden_size = int(kwargs.get("hidden_size", 64))
+        dropout = float(kwargs.get("dropout", 0.3))
+        self.side_head = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 2),
+        )
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        hidden = self.encode(features)
+        dropped = self.dropout(hidden)
+        entry_logits = self.collision_head(dropped).squeeze(-1)
+        entry_weights = (entry_logits / self.entry_temperature).softmax(dim=1)
+        entry_context = torch.bmm(entry_weights.unsqueeze(1), dropped).squeeze(1)
+        return {
+            "entry_logits": entry_logits,
+            "side_logits": self.side_head(entry_context),
+        }
+
+
+def entry_model_from_checkpoint(checkpoint: dict[str, Any]) -> nn.Module:
+    """Recreate either an Entry-only or Entry+Side comparison model."""
+
+    model_class = checkpoint.get("model_class", "CollisionFeatureModel")
+    if model_class == "CollisionFeatureModel":
+        model = CollisionFeatureModel(**checkpoint["model_config"])
+    elif model_class == "EntrySideFeatureModel":
+        model = EntrySideFeatureModel(**checkpoint["model_config"])
+    else:
+        raise ValueError(f"Unknown Entry model class: {model_class}")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model
 
 
 def _integer(value: Any, name: str) -> int:
@@ -39,6 +83,15 @@ def _confidence(value: Any) -> str:
     if value is None or pd.isna(value) or not str(value).strip():
         return "UNKNOWN"
     return str(value).strip().upper()
+
+
+def _side(value: Any, video_id: str) -> int | None:
+    if value is None or pd.isna(value) or not str(value).strip():
+        return None
+    name = str(value).strip().upper()
+    if name not in SIDE_TO_INDEX:
+        raise ValueError(f"Invalid entry_side for {video_id}: {value!r}")
+    return SIDE_TO_INDEX[name]
 
 
 def load_feature_samples(
@@ -92,6 +145,7 @@ def load_feature_samples(
                 "entry_confidence": _confidence(
                     getattr(row, "entry_confidence", None)
                 ),
+                "side": _side(getattr(row, "entry_side", None), str(row.ID)),
             }
         )
     if len(dimensions) != 1 or len(channels) != 1:
@@ -152,16 +206,39 @@ def entry_metrics(predictions: pd.DataFrame) -> dict[str, float | int]:
     return result
 
 
+def _macro_f1(targets: list[int], predictions: list[int]) -> float:
+    scores = []
+    for label in (0, 1):
+        true_positive = sum(
+            target == label and prediction == label
+            for target, prediction in zip(targets, predictions)
+        )
+        false_positive = sum(
+            target != label and prediction == label
+            for target, prediction in zip(targets, predictions)
+        )
+        false_negative = sum(
+            target == label and prediction != label
+            for target, prediction in zip(targets, predictions)
+        )
+        denominator = 2 * true_positive + false_positive + false_negative
+        scores.append(2 * true_positive / denominator if denominator else 0.0)
+    return float(np.mean(scores))
+
+
 @torch.inference_mode()
 def evaluate(
-    model: CollisionFeatureModel,
+    model: nn.Module,
     samples: list[dict[str, Any]],
     loss_fn: nn.Module,
+    side_loss_fn: nn.Module,
+    side_loss_weight: float,
     device: torch.device,
     amp: bool,
 ) -> tuple[dict[str, float | int], pd.DataFrame]:
     model.eval()
-    losses = []
+    entry_losses = []
+    side_losses = []
     rows = []
     for sample in samples:
         if sample["prior_frame"] is None:
@@ -170,8 +247,19 @@ def evaluate(
         with torch.autocast(
             device_type=device.type, dtype=torch.float16, enabled=amp
         ):
-            logits = model(inputs)
-            loss = loss_fn(logits, _loss_sample(sample))
+            outputs = model(inputs)
+            if isinstance(outputs, dict):
+                logits = outputs["entry_logits"]
+                side_logits = outputs["side_logits"]
+            else:
+                logits = outputs
+                side_logits = None
+            entry_loss = loss_fn(logits, _loss_sample(sample))
+            if side_logits is not None:
+                side_target = torch.tensor([sample["side"]], device=device)
+                side_loss = side_loss_fn(side_logits, side_target)
+            else:
+                side_loss = None
         predicted_index = int(logits.argmax(dim=1).item())
         predicted_frame = int(sample["frames"][predicted_index])
         error_frames = predicted_frame - sample["target_frame"]
@@ -188,26 +276,45 @@ def evaluate(
             comparison = "prior_only"
         else:
             comparison = "both_wrong"
-        losses.append(float(loss))
-        rows.append(
-            {
-                "ID": sample["ID"],
-                "target_frame": sample["target_frame"],
-                "predicted_frame": predicted_frame,
-                "prior_frame": sample["prior_frame"],
-                "fps": sample["fps"],
-                "error_frames": error_frames,
-                "abs_error_sec": error_sec,
-                "prior_error_frames": prior_error_frames,
-                "prior_abs_error_sec": prior_error_sec,
-                "model_correct_03": model_correct,
-                "prior_correct_03": prior_correct,
-                "comparison": comparison,
-                "entry_confidence": sample["entry_confidence"],
-            }
-        )
+        entry_losses.append(float(entry_loss))
+        row = {
+            "ID": sample["ID"],
+            "target_frame": sample["target_frame"],
+            "predicted_frame": predicted_frame,
+            "prior_frame": sample["prior_frame"],
+            "fps": sample["fps"],
+            "error_frames": error_frames,
+            "abs_error_sec": error_sec,
+            "prior_error_frames": prior_error_frames,
+            "prior_abs_error_sec": prior_error_sec,
+            "model_correct_03": model_correct,
+            "prior_correct_03": prior_correct,
+            "comparison": comparison,
+            "entry_confidence": sample["entry_confidence"],
+        }
+        if side_logits is not None and side_loss is not None:
+            predicted_side = int(side_logits.argmax(dim=1).item())
+            side_losses.append(float(side_loss))
+            row.update(
+                target_side=sample["side"],
+                predicted_side=predicted_side,
+                side_correct=predicted_side == sample["side"],
+            )
+        rows.append(row)
     predictions = pd.DataFrame(rows)
-    return {"loss": float(np.mean(losses)), **entry_metrics(predictions)}, predictions
+    metrics: dict[str, float | int] = {
+        "loss": float(np.mean(entry_losses)),
+        **entry_metrics(predictions),
+    }
+    if side_losses:
+        metrics["side_loss"] = float(np.mean(side_losses))
+        metrics["total_loss"] = metrics["loss"] + side_loss_weight * metrics["side_loss"]
+        metrics["side_accuracy"] = float(predictions["side_correct"].mean())
+        metrics["side_macro_f1"] = _macro_f1(
+            predictions["target_side"].astype(int).tolist(),
+            predictions["predicted_side"].astype(int).tolist(),
+        )
+    return metrics, predictions
 
 
 def _reset_seed(seed: int) -> np.random.Generator:
@@ -228,6 +335,7 @@ def _checkpoint(
     epoch: int,
     metrics: dict[str, float | int],
     seed: int,
+    model_class: str,
 ) -> dict[str, Any]:
     return {
         "model_state_dict": {
@@ -241,6 +349,7 @@ def _checkpoint(
         "metrics": metrics,
         "seed": seed,
         "task": "entry_frame_feature_compare",
+        "model_class": model_class,
     }
 
 
@@ -272,8 +381,22 @@ def train_one_feature(
         "delta_mode": args.delta_mode,
         "spatial_coordinates": args.spatial_coordinates,
     }
-    model = CollisionFeatureModel(**model_config).to(device)
+    side_loss_weight = args.side_loss_weight
+    if side_loss_weight > 0:
+        missing_side = [sample["ID"] for sample in samples if sample["side"] is None]
+        if missing_side:
+            raise ValueError(
+                f"Side auxiliary loss requires entry_side for every sample: "
+                f"{missing_side[:10]}"
+            )
+        model_config["entry_temperature"] = args.entry_temperature
+        model: nn.Module = EntrySideFeatureModel(**model_config).to(device)
+        model_class = "EntrySideFeatureModel"
+    else:
+        model = CollisionFeatureModel(**model_config).to(device)
+        model_class = "CollisionFeatureModel"
     loss_fn = make_temporal_loss("gaussian_ce", sigma_sec=args.sigma_sec)
+    side_loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -293,6 +416,12 @@ def train_one_feature(
         "feature_config": feature_info["feature_config"],
         "model_config": model_config,
         "loss": loss_fn.config,
+        "side_auxiliary": {
+            "enabled": side_loss_weight > 0,
+            "weight": side_loss_weight,
+            "entry_temperature": args.entry_temperature,
+            "side_to_index": SIDE_TO_INDEX,
+        },
         "optimizer": {
             "name": "AdamW",
             "lr": args.lr,
@@ -305,7 +434,7 @@ def train_one_feature(
             "min_lr": 1e-6,
         },
         "early_stopping": {
-            "metric": "validation loss",
+            "metric": "validation entry loss",
             "patience": args.early_patience,
             "min_delta": args.early_min_delta,
         },
@@ -321,7 +450,8 @@ def train_one_feature(
     print(
         f"Feature: {feature_name} | kind={feature_info['feature_kind']} | "
         f"channels={feature_info['input_channels']} | delta={args.delta_mode} | "
-        f"spatial coordinates={args.spatial_coordinates}"
+        f"spatial coordinates={args.spatial_coordinates} | "
+        f"side loss weight={side_loss_weight}"
     )
     print(
         f"Train: {len(train_samples)} | Val: {len(val_samples)} | "
@@ -336,6 +466,8 @@ def train_one_feature(
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_losses = []
+        train_entry_losses = []
+        train_side_losses = []
         lr = optimizer.param_groups[0]["lr"]
         for sample_index in rng.permutation(len(train_samples)):
             sample = train_samples[int(sample_index)]
@@ -346,8 +478,18 @@ def train_one_feature(
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=amp
             ):
-                logits = model(inputs)
-                loss = loss_fn(logits, _loss_sample(sample))
+                outputs = model(inputs)
+                if isinstance(outputs, dict):
+                    logits = outputs["entry_logits"]
+                    entry_loss = loss_fn(logits, _loss_sample(sample))
+                    side_target = torch.tensor([sample["side"]], device=device)
+                    side_loss = side_loss_fn(outputs["side_logits"], side_target)
+                    loss = entry_loss + side_loss_weight * side_loss
+                else:
+                    logits = outputs
+                    entry_loss = loss_fn(logits, _loss_sample(sample))
+                    side_loss = None
+                    loss = entry_loss
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss for {sample['ID']}")
             scaler.scale(loss).backward()
@@ -356,8 +498,19 @@ def train_one_feature(
             scaler.step(optimizer)
             scaler.update()
             train_losses.append(float(loss.detach()))
+            train_entry_losses.append(float(entry_loss.detach()))
+            if side_loss is not None:
+                train_side_losses.append(float(side_loss.detach()))
 
-        metrics, predictions = evaluate(model, val_samples, loss_fn, device, amp)
+        metrics, predictions = evaluate(
+            model,
+            val_samples,
+            loss_fn,
+            side_loss_fn,
+            side_loss_weight,
+            device,
+            amp,
+        )
         scheduler.step(metrics["loss"])
         next_lr = optimizer.param_groups[0]["lr"]
         accuracy_improved = metrics["acc_03"] > best_acc + 1e-12 or (
@@ -374,6 +527,7 @@ def train_one_feature(
             epoch,
             metrics,
             args.seed,
+            model_class,
         )
         saved = []
         if accuracy_improved:
@@ -405,6 +559,10 @@ def train_one_feature(
             {
                 "epoch": epoch,
                 "train_loss": float(np.mean(train_losses)),
+                "train_entry_loss": float(np.mean(train_entry_losses)),
+                "train_side_loss": (
+                    float(np.mean(train_side_losses)) if train_side_losses else float("nan")
+                ),
                 "lr": lr,
                 "next_lr": next_lr,
                 "bad_epochs": bad_epochs,
@@ -414,12 +572,18 @@ def train_one_feature(
             }
         )
         pd.DataFrame(history).to_csv(experiment_dir / "history.csv", index=False)
+        side_status = (
+            f" | side F1 {metrics['side_macro_f1']:.3f}"
+            if "side_macro_f1" in metrics
+            else ""
+        )
         print(
             f"{feature_name} | Epoch {epoch:02d} | LR {lr:.2e} | "
-            f"train {history[-1]['train_loss']:.4f} | val {metrics['loss']:.4f} | "
+            f"train {history[-1]['train_loss']:.4f} | "
+            f"val entry {metrics['loss']:.4f} | "
             f"@0.3 {metrics['acc_03']:.1%} | prior {metrics['prior_acc_03']:.1%} | "
             f"model-only {metrics['model_only']} | prior-only {metrics['prior_only']} | "
-            f"median {metrics['median_sec']:.3f}s | {status}"
+            f"median {metrics['median_sec']:.3f}s{side_status} | {status}"
         )
         if next_lr < lr:
             print(f"{feature_name} | next LR: {next_lr:.2e}")
@@ -483,6 +647,13 @@ def parse_args() -> argparse.Namespace:
             "the temporal model; spatial feature banks only"
         ),
     )
+    parser.add_argument(
+        "--side-loss-weight",
+        type=float,
+        default=0.0,
+        help="enable the Entry-side auxiliary head with this loss weight",
+    )
+    parser.add_argument("--entry-temperature", type=float, default=1.0)
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-patience", type=int, default=10)
@@ -504,6 +675,10 @@ def main() -> None:
         raise ValueError("epochs and early-patience must be positive")
     if args.early_min_delta < 0:
         raise ValueError("early-min-delta cannot be negative")
+    if args.side_loss_weight < 0:
+        raise ValueError("side-loss-weight cannot be negative")
+    if args.entry_temperature <= 0:
+        raise ValueError("entry-temperature must be positive")
     labels = load_entry_labels(args.labels.expanduser().resolve())
     if args.expected_count is not None and len(labels) != args.expected_count:
         raise ValueError(f"Expected {args.expected_count} labels, got {len(labels)}")
@@ -527,6 +702,10 @@ def main() -> None:
     )
     print(f"Features: {args.features} | Delta: {args.delta_mode} | Loss: gaussian_ce")
     print(f"Spatial coordinates: {args.spatial_coordinates}")
+    print(
+        f"Side auxiliary: weight={args.side_loss_weight} | "
+        f"entry temperature={args.entry_temperature}"
+    )
 
     output_root = args.output_root.expanduser().resolve()
     feature_root = args.feature_root.expanduser().resolve()
@@ -574,23 +753,22 @@ def main() -> None:
     )
     print("=" * 88)
     print("Entry feature comparison")
-    print(
-        comparison[
-            [
-                "feature",
-                "best_epoch",
-                "acc_03",
-                "prior_acc_03",
-                "model_only",
-                "prior_only",
-                "both_correct",
-                "both_wrong",
-                "median_sec",
-                "mean_sec",
-                "loss",
-            ]
-        ].to_string(index=False)
-    )
+    summary_columns = [
+        "feature",
+        "best_epoch",
+        "acc_03",
+        "prior_acc_03",
+        "model_only",
+        "prior_only",
+        "both_correct",
+        "both_wrong",
+        "median_sec",
+        "mean_sec",
+        "loss",
+    ]
+    if "side_macro_f1" in comparison:
+        summary_columns.extend(["side_accuracy", "side_macro_f1"])
+    print(comparison[summary_columns].to_string(index=False))
     print(f"Run: {run_dir}")
     print(f"Ranked summary: {run_dir / 'comparison_ranked.csv'}")
 

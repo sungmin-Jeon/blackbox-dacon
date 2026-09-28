@@ -115,7 +115,9 @@ class CollisionFeatureModel(nn.Module):
         later = features[:, 1:] - features[:, :-1]
         return torch.cat([first, later], dim=1)
 
-    def forward(self, features: Tensor) -> Tensor:
+    def encode(self, features: Tensor) -> Tensor:
+        """Project frame features and return contextual temporal states."""
+
         if self.feature_kind == "global":
             if features.ndim != 3:
                 raise ValueError("Global features must have shape [B,T,C]")
@@ -142,6 +144,10 @@ class CollisionFeatureModel(nn.Module):
         else:
             vectors, _ = self.project(features)
         hidden, _ = self.temporal(vectors)
+        return hidden
+
+    def forward(self, features: Tensor) -> Tensor:
+        hidden = self.encode(features)
         return self.collision_head(self.dropout(hidden)).squeeze(-1)
 
 

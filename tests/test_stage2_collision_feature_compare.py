@@ -35,6 +35,31 @@ class CollisionFeatureCompareTests(unittest.TestCase):
                 )
                 self.assertEqual(model(features).shape, (2, 5))
 
+    def test_delta_is_aligned_and_concat_models_accept_base_features(self):
+        features = torch.tensor([[[1.0, 3.0], [4.0, 2.0], [9.0, 8.0]]])
+        expected = torch.tensor([[[0.0, 0.0], [3.0, -1.0], [5.0, 6.0]]])
+        torch.testing.assert_close(
+            CollisionFeatureModel.temporal_delta(features), expected
+        )
+
+        cases = [
+            ("global", 8, torch.randn(2, 5, 8)),
+            ("spatial", 8, torch.randn(2, 5, 8, 3, 4)),
+        ]
+        for feature_kind, channels, inputs in cases:
+            with self.subTest(feature_kind=feature_kind):
+                model = CollisionFeatureModel(
+                    feature_kind=feature_kind,
+                    input_channels=channels,
+                    projection_size=4,
+                    temporal_input_size=6,
+                    hidden_size=3,
+                    num_layers=1,
+                    dropout=0.0,
+                    delta_mode="concat",
+                )
+                self.assertEqual(model(inputs).shape, (2, 5))
+
     def test_loader_detects_feature_kind_and_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -99,6 +124,7 @@ class CollisionFeatureCompareTests(unittest.TestCase):
                 hidden_size=3,
                 num_layers=1,
                 dropout=0.0,
+                delta_mode="none",
                 sigma_sec=0.1,
                 lr=2e-4,
                 weight_decay=1e-4,

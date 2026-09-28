@@ -37,21 +37,26 @@ class CollisionFeatureModel(nn.Module):
         hidden_size: int = 64,
         num_layers: int = 1,
         dropout: float = 0.3,
+        delta_mode: str = "none",
     ) -> None:
         super().__init__()
         if feature_kind not in {"global", "spatial"}:
             raise ValueError("feature_kind must be global or spatial")
+        if delta_mode not in {"none", "concat"}:
+            raise ValueError("delta_mode must be none or concat")
         self.feature_kind = feature_kind
+        self.delta_mode = delta_mode
+        projected_channels = input_channels * (2 if delta_mode == "concat" else 1)
         if feature_kind == "global":
             self.project = nn.Sequential(
-                nn.Linear(input_channels, temporal_input_size),
+                nn.Linear(projected_channels, temporal_input_size),
                 nn.LayerNorm(temporal_input_size),
                 nn.GELU(),
                 nn.Dropout(dropout),
             )
         else:
             self.project = SpatialAttentionPool(
-                input_channels=input_channels,
+                input_channels=projected_channels,
                 projection_size=projection_size,
                 output_size=temporal_input_size,
                 dropout=dropout,
@@ -67,14 +72,33 @@ class CollisionFeatureModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.collision_head = nn.Linear(hidden_size * 2, 1)
 
+    @staticmethod
+    def temporal_delta(features: Tensor) -> Tensor:
+        """Return signed x[t] - x[t-1], aligned to the current frame."""
+
+        if features.ndim not in {3, 5} or features.shape[1] == 0:
+            raise ValueError("Features must be non-empty [B,T,C] or [B,T,C,H,W]")
+        first = torch.zeros_like(features[:, :1])
+        later = features[:, 1:] - features[:, :-1]
+        return torch.cat([first, later], dim=1)
+
     def forward(self, features: Tensor) -> Tensor:
         if self.feature_kind == "global":
             if features.ndim != 3:
                 raise ValueError("Global features must have shape [B,T,C]")
-            vectors = self.project(features)
         else:
             if features.ndim != 5:
                 raise ValueError("Spatial features must have shape [B,T,C,H,W]")
+
+        if self.delta_mode == "concat":
+            features = torch.cat(
+                [features, self.temporal_delta(features)],
+                dim=2,
+            )
+
+        if self.feature_kind == "global":
+            vectors = self.project(features)
+        else:
             vectors, _ = self.project(features)
         hidden, _ = self.temporal(vectors)
         return self.collision_head(self.dropout(hidden)).squeeze(-1)
@@ -227,6 +251,7 @@ def train_one_feature(
         "hidden_size": args.hidden_size,
         "num_layers": args.num_layers,
         "dropout": args.dropout,
+        "delta_mode": args.delta_mode,
     }
     model = CollisionFeatureModel(**model_config).to(device)
     loss_fn = make_temporal_loss("gaussian_ce", sigma_sec=args.sigma_sec)
@@ -279,7 +304,7 @@ def train_one_feature(
     print("=" * 88)
     print(
         f"Feature: {feature_name} | kind={feature_info['feature_kind']} | "
-        f"channels={feature_info['input_channels']}"
+        f"channels={feature_info['input_channels']} | delta={args.delta_mode}"
     )
     print(
         f"Train: {len(train_samples)} | Val: {len(val_samples)} | "
@@ -439,6 +464,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument(
+        "--delta-mode",
+        choices=("none", "concat"),
+        default="none",
+        help="concat appends signed feature[t]-feature[t-1] along channels",
+    )
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-patience", type=int, default=10)
@@ -471,7 +502,7 @@ def main() -> None:
     split_counts = labels["split"].value_counts().to_dict()
     print(f"Labels: {len(labels)} | Split: {split_counts}")
     print(f"Features: {args.features}")
-    print("Delta: disabled | Loss: gaussian_ce")
+    print(f"Delta: {args.delta_mode} | Loss: gaussian_ce")
 
     run_dir = output_root / (
         args.name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")

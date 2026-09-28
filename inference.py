@@ -715,6 +715,245 @@ class _Stage2DirectSpatial(nn.Module):
         return entry_logits, side_logits, evasion_logits
 
 
+class _Stage2FeatureTemporal(nn.Module):
+    """Submission copy of the cached spatial-feature temporal model."""
+
+    def __init__(
+        self,
+        *,
+        feature_kind: str,
+        input_channels: int,
+        projection_size: int = 128,
+        temporal_input_size: int = 256,
+        hidden_size: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.3,
+        delta_mode: str = "none",
+        spatial_coordinates: bool = False,
+    ) -> None:
+        super().__init__()
+        if feature_kind != "spatial":
+            raise ValueError("Final Stage 2 feature models require spatial features")
+        if delta_mode not in {"none", "concat"}:
+            raise ValueError(f"Unsupported final Stage 2 delta mode: {delta_mode}")
+        if spatial_coordinates:
+            raise ValueError("Final Stage 2 model does not use coordinate summaries")
+        self.delta_mode = delta_mode
+        projected_channels = input_channels * (2 if delta_mode == "concat" else 1)
+        self.project = _Stage2SpatialAttentionPool(
+            input_channels=projected_channels,
+            projection_size=projection_size,
+            output_size=temporal_input_size,
+            dropout=dropout,
+        )
+        self.temporal = nn.GRU(
+            temporal_input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.collision_head = nn.Linear(hidden_size * 2, 1)
+
+    @staticmethod
+    def temporal_delta(features: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [torch.zeros_like(features[:, :1]), features[:, 1:] - features[:, :-1]],
+            dim=1,
+        )
+
+    def encode(self, features: torch.Tensor) -> torch.Tensor:
+        if self.delta_mode == "concat":
+            features = torch.cat([features, self.temporal_delta(features)], dim=2)
+        vectors = self.project(features)
+        hidden, _ = self.temporal(vectors)
+        return hidden
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        hidden = self.encode(features)
+        return self.collision_head(self.dropout(hidden)).squeeze(-1)
+
+
+class _Stage2EntrySideTemporal(_Stage2FeatureTemporal):
+    def __init__(
+        self,
+        *,
+        entry_temperature: float = 1.0,
+        side_context: str = "entry",
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        if side_context not in {"entry", "independent"}:
+            raise ValueError(f"Unsupported Side context: {side_context}")
+        self.entry_temperature = entry_temperature
+        self.side_context = side_context
+        hidden_size = int(kwargs.get("hidden_size", 64))
+        dropout = float(kwargs.get("dropout", 0.3))
+        self.side_attention = (
+            nn.Linear(hidden_size * 2, 1)
+            if side_context == "independent"
+            else None
+        )
+        self.side_head = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 2),
+        )
+
+    def forward(self, features: torch.Tensor):
+        hidden = self.encode(features)
+        dropped = self.dropout(hidden)
+        entry_logits = self.collision_head(dropped).squeeze(-1)
+        if self.side_context == "entry":
+            side_weights = (entry_logits / self.entry_temperature).softmax(dim=1)
+        else:
+            side_weights = self.side_attention(dropped).squeeze(-1).softmax(dim=1)
+        side_context = torch.bmm(side_weights.unsqueeze(1), dropped).squeeze(1)
+        return entry_logits, self.side_head(side_context)
+
+
+def _stage2_final_models(model_dir: Path, device: torch.device):
+    paths = {
+        name: model_dir / f"{name}.pt"
+        for name in ("collision", "entry", "side", "evasion")
+    }
+    if not all(path.is_file() for path in paths.values()):
+        return None
+    checkpoints = {
+        name: torch.load(path, map_location="cpu", weights_only=False)
+        for name, path in paths.items()
+    }
+    collision = _Stage2FeatureTemporal(**checkpoints["collision"]["model_config"])
+    collision.load_state_dict(checkpoints["collision"]["model_state_dict"])
+    entry = _Stage2EntrySideTemporal(**checkpoints["entry"]["model_config"])
+    entry.load_state_dict(checkpoints["entry"]["model_state_dict"])
+    side = _Stage2EntrySideTemporal(**checkpoints["side"]["model_config"])
+    side.load_state_dict(checkpoints["side"]["model_state_dict"])
+    evasion = _Stage2DirectSpatial(**checkpoints["evasion"]["model_config"])
+    evasion.load_state_dict(checkpoints["evasion"]["model_state_dict"])
+    models = {
+        "collision": collision.to(device).eval(),
+        "entry": entry.to(device).eval(),
+        "side": side.to(device).eval(),
+        "evasion": evasion.to(device).eval(),
+    }
+    return models, checkpoints
+
+
+def _stage2_final_feature_config(checkpoints):
+    configs = [checkpoint.get("feature_config", {}) for checkpoint in checkpoints.values()]
+    layer = configs[0].get("layer", "layer3")
+    short_edge = int(configs[0].get("short_edge", 256))
+    mean = tuple(configs[0].get("mean", (0.485, 0.456, 0.406)))
+    std = tuple(configs[0].get("std", (0.229, 0.224, 0.225)))
+    for config in configs:
+        current = (
+            config.get("layer", "layer3"),
+            int(config.get("short_edge", 256)),
+            tuple(config.get("mean", mean)),
+            tuple(config.get("std", std)),
+            config.get("crop"),
+        )
+        if current != (layer, short_edge, mean, std, None):
+            raise ValueError("Final Stage 2 checkpoints use different feature settings")
+    if layer not in {"layer3", "layer4"} or short_edge < 32:
+        raise ValueError("Unsupported final Stage 2 feature settings")
+    return layer, short_edge, mean, std
+
+
+def _predict_stage2_final(data_dir, backbone, models, checkpoints, device):
+    layer, short_edge, mean_values, std_values = _stage2_final_feature_config(
+        checkpoints
+    )
+    mean = torch.tensor(mean_values, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(std_values, device=device).view(1, 3, 1, 1)
+    expected_channels = 256 if layer == "layer3" else 512
+    for name in ("collision", "entry", "side"):
+        actual = int(checkpoints[name]["model_config"]["input_channels"])
+        if actual != expected_channels:
+            raise ValueError(f"Stage 2 {name} channels do not match {layer}")
+    evasion_channels = int(checkpoints["evasion"]["model_config"]["input_channels"])
+    if evasion_channels != expected_channels:
+        raise ValueError("Stage 2 evasion channels do not match feature layer")
+
+    folders = sorted(
+        path for path in (Path(data_dir) / "images").iterdir() if path.is_dir()
+    )
+    rows = []
+    with torch.inference_mode():
+        for folder in folders:
+            paths = sorted(
+                (
+                    path
+                    for path in folder.iterdir()
+                    if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+                ),
+                key=_frame_number,
+            )
+            if not paths:
+                continue
+            loader = DataLoader(
+                _Stage2RawFrames(paths),
+                batch_size=64,
+                num_workers=6,
+                pin_memory=True,
+            )
+            spatial_maps = []
+            for uint8_images in loader:
+                images = uint8_images.to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                ).div_(255)
+                images = _stage2_resize_short_edge(images, short_edge)
+                images = (images - mean) / std
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=device.type == "cuda",
+                ):
+                    maps = _stage2_spatial_features(backbone, images, layer)
+                spatial_maps.append(maps.half().cpu())
+                del images, maps
+
+            sequence = torch.cat(spatial_maps)[None].to(
+                device=device, dtype=torch.float32
+            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=device.type == "cuda",
+            ):
+                collision_logits = models["collision"](sequence)
+                entry_logits, _ = models["entry"](sequence)
+                _, side_logits = models["side"](sequence)
+                collision_index = int(collision_logits.argmax(1).item())
+                _, _, evasion_logits = models["evasion"](
+                    sequence,
+                    torch.tensor([collision_index], device=device),
+                )
+            entry_index = int(entry_logits.argmax(1).item())
+            entry_side = "RIGHT" if int(side_logits.argmax(1).item()) == 1 else "LEFT"
+            evasion_space = int(evasion_logits.argmax(1).item())
+            frame_numbers = [_frame_number(path) for path in paths]
+            rows.append(
+                {
+                    "ID": folder.name,
+                    "collision_frame": frame_numbers[collision_index],
+                    "entry_frame": frame_numbers[entry_index],
+                    "evasion_space": evasion_space,
+                    "entry_side": entry_side,
+                }
+            )
+            del sequence, spatial_maps, collision_logits, entry_logits
+            del side_logits, evasion_logits
+    return pd.DataFrame(
+        rows,
+        columns=["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"],
+    )
+
+
 def _frame_number(path: Path) -> int:
     match = re.search(r"(\d+)$", path.stem)
     return int(match.group(1)) if match else 0
@@ -757,6 +996,16 @@ def predict_stage2(data_dir, model_dir):
     )
     backbone.fc = nn.Identity()
     backbone.to(device).eval()
+
+    final = _stage2_final_models(model_dir, device)
+    if final is not None:
+        models, checkpoints = final
+        result = _predict_stage2_final(
+            data_dir, backbone, models, checkpoints, device
+        )
+        del backbone, models
+        torch.cuda.empty_cache()
+        return result
 
     checkpoint = torch.load(model_dir / "best.pt", map_location="cpu", weights_only=False)
     collision_model, _ = _stage2_collision_model_from_checkpoint(checkpoint)

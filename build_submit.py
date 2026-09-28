@@ -9,13 +9,24 @@ from pathlib import Path
 
 
 REQUIRED_FUNCTIONS = {"predict_stage1", "predict_stage2", "predict_stage3"}
-REQUIRED_MODELS = {
+COMMON_MODELS = {
     "stage1/best.pt",
-    "stage2/best.pt",
-    "stage2/direct.pt",
     "stage2/resnet18-f37072fd.pth",
     "stage3/best.pt",
 }
+LEGACY_STAGE2_MODELS = {"stage2/best.pt", "stage2/direct.pt"}
+FINAL_STAGE2_MODELS = {
+    "stage2/collision.pt",
+    "stage2/entry.pt",
+    "stage2/side.pt",
+    "stage2/evasion.pt",
+}
+
+
+def required_models(model_dir: Path) -> set[str]:
+    if all((model_dir / relative).is_file() for relative in FINAL_STAGE2_MODELS):
+        return COMMON_MODELS | FINAL_STAGE2_MODELS
+    return COMMON_MODELS | LEGACY_STAGE2_MODELS
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +60,11 @@ def validate_source(inference_file: Path) -> str:
 def validate_inputs(requirements_file: Path, model_dir: Path) -> None:
     if not requirements_file.is_file():
         raise FileNotFoundError(f"Requirements file does not exist: {requirements_file}")
-    missing = sorted(relative for relative in REQUIRED_MODELS if not (model_dir / relative).is_file())
+    missing = sorted(
+        relative
+        for relative in required_models(model_dir)
+        if not (model_dir / relative).is_file()
+    )
     if missing:
         raise FileNotFoundError(f"Missing model files under {model_dir}: {missing}")
 
@@ -79,8 +94,14 @@ def validate_archive(output: Path) -> list[str]:
         names = archive.namelist()
         zipped_source = archive.read("inference.py").decode("utf-8")
 
+    final_paths = {f"model/{relative}" for relative in FINAL_STAGE2_MODELS}
+    stage2_models = (
+        FINAL_STAGE2_MODELS
+        if final_paths.issubset(set(names))
+        else LEGACY_STAGE2_MODELS
+    )
     required_paths = {"inference.py", "requirements.txt"} | {
-        f"model/{relative}" for relative in REQUIRED_MODELS
+        f"model/{relative}" for relative in COMMON_MODELS | stage2_models
     }
     missing_paths = sorted(required_paths - set(names))
     if missing_paths:

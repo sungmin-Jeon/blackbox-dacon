@@ -14,14 +14,20 @@ import torch
 
 from build_submit import build_archive, validate_archive, validate_inputs, validate_source
 from src.stage2.collision_predict import collision_model_from_checkpoint
+from src.stage2.collision_feature_compare import CollisionFeatureModel
 from src.stage2.direct_model import direct_model_from_checkpoint
+from src.stage2.entry_feature_compare import entry_model_from_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1-checkpoint", type=Path, required=True)
-    parser.add_argument("--stage2-checkpoint", type=Path, required=True)
-    parser.add_argument("--stage2-direct-checkpoint", type=Path, required=True)
+    parser.add_argument("--stage2-checkpoint", type=Path, default=None)
+    parser.add_argument("--stage2-direct-checkpoint", type=Path, default=None)
+    parser.add_argument("--stage2-collision-checkpoint", type=Path, default=None)
+    parser.add_argument("--stage2-entry-checkpoint", type=Path, default=None)
+    parser.add_argument("--stage2-side-checkpoint", type=Path, default=None)
+    parser.add_argument("--stage2-evasion-checkpoint", type=Path, default=None)
     parser.add_argument("--stage2-backbone", type=Path, required=True)
     parser.add_argument("--stage3-checkpoint", type=Path, required=True)
     parser.add_argument("--inference-file", type=Path, default=Path("inference.py"))
@@ -80,35 +86,107 @@ def _validate_stage2_checkpoints(
     return collision_format, collision_checkpoint, direct_checkpoint
 
 
+def _load_checkpoint(path: Path, label: str) -> tuple[Path, dict]:
+    resolved = _existing_file(path, label)
+    return resolved, torch.load(resolved, map_location="cpu", weights_only=False)
+
+
+def _validate_stage2_final(args: argparse.Namespace) -> dict[str, tuple[Path, dict]]:
+    paths = {
+        "collision": args.stage2_collision_checkpoint,
+        "entry": args.stage2_entry_checkpoint,
+        "side": args.stage2_side_checkpoint,
+        "evasion": args.stage2_evasion_checkpoint,
+    }
+    if not all(paths.values()):
+        missing = [name for name, path in paths.items() if path is None]
+        raise ValueError(f"Missing final Stage 2 checkpoints: {missing}")
+    loaded = {
+        name: _load_checkpoint(path, f"Stage 2 {name} checkpoint")
+        for name, path in paths.items()
+    }
+    collision = loaded["collision"][1]
+    collision_model = CollisionFeatureModel(**collision["model_config"])
+    collision_model.load_state_dict(collision["model_state_dict"])
+    for name in ("entry", "side"):
+        checkpoint = loaded[name][1]
+        model = entry_model_from_checkpoint(checkpoint)
+        if checkpoint.get("model_class") != "EntrySideFeatureModel":
+            raise ValueError(f"Stage 2 {name} checkpoint has no Side-capable model")
+        del model
+    direct_model_from_checkpoint(loaded["evasion"][1])
+
+    signatures = []
+    for _, checkpoint in loaded.values():
+        config = checkpoint.get("feature_config", {})
+        signatures.append(
+            (
+                config.get("layer", "layer3"),
+                int(config.get("short_edge", 256)),
+                tuple(config.get("mean", (0.485, 0.456, 0.406))),
+                tuple(config.get("std", (0.229, 0.224, 0.225))),
+                config.get("crop"),
+            )
+        )
+    if len(set(signatures)) != 1 or signatures[0][4] is not None:
+        raise ValueError("Final Stage 2 checkpoints use incompatible feature settings")
+    return loaded
+
+
 def main() -> None:
     args = parse_args()
     inference_file = _existing_file(args.inference_file, "inference file")
     requirements_file = _existing_file(args.requirements_file, "requirements file")
     output = args.output.expanduser().resolve()
 
-    stage2_checkpoint = _existing_file(
-        args.stage2_checkpoint, "Stage 2 checkpoint"
+    final_requested = any(
+        path is not None
+        for path in (
+            args.stage2_collision_checkpoint,
+            args.stage2_entry_checkpoint,
+            args.stage2_side_checkpoint,
+            args.stage2_evasion_checkpoint,
+        )
     )
-    stage2_direct_checkpoint = _existing_file(
-        args.stage2_direct_checkpoint, "Stage 2 Direct checkpoint"
-    )
-    collision_format, collision_checkpoint, direct_checkpoint = (
-        _validate_stage2_checkpoints(stage2_checkpoint, stage2_direct_checkpoint)
-    )
-    print(f"Stage 2 collision checkpoint format: {collision_format}")
-    print(f"Stage 2 collision task: {collision_checkpoint.get('task', 'unspecified')}")
-    print(f"Stage 2 Direct task: {direct_checkpoint.get('task', 'unspecified')}")
-
     model_sources = {
         "stage1/best.pt": _existing_file(args.stage1_checkpoint, "Stage 1 checkpoint"),
-        "stage2/best.pt": stage2_checkpoint,
-        "stage2/direct.pt": stage2_direct_checkpoint,
         "stage2/resnet18-f37072fd.pth": _existing_file(
             args.stage2_backbone,
             "Stage 2 backbone",
         ),
         "stage3/best.pt": _existing_file(args.stage3_checkpoint, "Stage 3 checkpoint"),
     }
+    if final_requested:
+        loaded = _validate_stage2_final(args)
+        for name, (path, checkpoint) in loaded.items():
+            model_sources[f"stage2/{name}.pt"] = path
+            print(
+                f"Stage 2 {name}: epoch={checkpoint.get('epoch')} | "
+                f"task={checkpoint.get('task', 'unspecified')}"
+            )
+    else:
+        if args.stage2_checkpoint is None or args.stage2_direct_checkpoint is None:
+            raise ValueError(
+                "Provide either all four final Stage 2 checkpoints or both legacy "
+                "--stage2-checkpoint and --stage2-direct-checkpoint"
+            )
+        stage2_checkpoint = _existing_file(
+            args.stage2_checkpoint, "Stage 2 checkpoint"
+        )
+        stage2_direct_checkpoint = _existing_file(
+            args.stage2_direct_checkpoint, "Stage 2 Direct checkpoint"
+        )
+        collision_format, collision_checkpoint, direct_checkpoint = (
+            _validate_stage2_checkpoints(stage2_checkpoint, stage2_direct_checkpoint)
+        )
+        print(f"Stage 2 collision checkpoint format: {collision_format}")
+        print(
+            f"Stage 2 collision task: "
+            f"{collision_checkpoint.get('task', 'unspecified')}"
+        )
+        print(f"Stage 2 Direct task: {direct_checkpoint.get('task', 'unspecified')}")
+        model_sources["stage2/best.pt"] = stage2_checkpoint
+        model_sources["stage2/direct.pt"] = stage2_direct_checkpoint
 
     source = validate_source(inference_file)
     with tempfile.TemporaryDirectory(prefix="blackbox-submit-") as temporary:

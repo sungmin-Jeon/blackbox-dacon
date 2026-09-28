@@ -12,7 +12,9 @@ from torch.utils.data import DataLoader as TorchDataLoader
 from torchvision.models import resnet18
 
 import inference
+from src.stage2.collision_feature_compare import CollisionFeatureModel
 from src.stage2.direct_model import Stage2DirectSpatial
+from src.stage2.entry_feature_compare import EntrySideFeatureModel
 from src.stage2.spatial_extract import resize_short_edge
 
 
@@ -48,6 +50,47 @@ class Stage2InferenceTests(unittest.TestCase):
             inference._stage2_resize_short_edge(images, 64),
             resize_short_edge(images, 64),
         )
+
+    def test_final_collision_submission_model_matches_training_model(self):
+        config = {
+            "feature_kind": "spatial",
+            "input_channels": 8,
+            "projection_size": 4,
+            "temporal_input_size": 6,
+            "hidden_size": 3,
+            "num_layers": 1,
+            "dropout": 0.0,
+            "delta_mode": "concat",
+            "spatial_coordinates": False,
+        }
+        trained = CollisionFeatureModel(**config).eval()
+        submitted = inference._Stage2FeatureTemporal(**config).eval()
+        submitted.load_state_dict(trained.state_dict())
+        maps = torch.randn(2, 7, 8, 3, 5)
+        torch.testing.assert_close(submitted(maps), trained(maps))
+
+    def test_final_entry_side_submission_model_matches_training_model(self):
+        config = {
+            "feature_kind": "spatial",
+            "input_channels": 8,
+            "projection_size": 4,
+            "temporal_input_size": 6,
+            "hidden_size": 3,
+            "num_layers": 1,
+            "dropout": 0.0,
+            "delta_mode": "concat",
+            "spatial_coordinates": False,
+            "entry_temperature": 1.0,
+            "side_context": "independent",
+        }
+        trained = EntrySideFeatureModel(**config).eval()
+        submitted = inference._Stage2EntrySideTemporal(**config).eval()
+        submitted.load_state_dict(trained.state_dict())
+        maps = torch.randn(2, 7, 8, 3, 5)
+        expected = trained(maps)
+        entry, side = submitted(maps)
+        torch.testing.assert_close(entry, expected["entry_logits"])
+        torch.testing.assert_close(side, expected["side_logits"])
 
     def test_predict_stage2_uses_both_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:

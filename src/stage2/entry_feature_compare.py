@@ -429,6 +429,7 @@ def train_one_feature(
     best_path = experiment_dir / "best_model.pt"
     best_accuracy_path = experiment_dir / "best_accuracy_model.pt"
     best_loss_path = experiment_dir / "best_loss_model.pt"
+    best_side_path = experiment_dir / "best_side_model.pt"
     config = {
         "feature_name": feature_name,
         "feature_dir": str(feature_dir),
@@ -458,6 +459,11 @@ def train_one_feature(
             "patience": args.early_patience,
             "min_delta": args.early_min_delta,
         },
+        "checkpoint_selection": {
+            "best_accuracy_model.pt": "highest Entry Accuracy@0.3s",
+            "best_loss_model.pt": "lowest validation Entry loss",
+            "best_side_model.pt": "highest validation Side Macro-F1",
+        },
         "prior": "train median relative entry position",
         "train_ids": [sample["ID"] for sample in train_samples],
         "val_ids": [sample["ID"] for sample in val_samples],
@@ -481,6 +487,8 @@ def train_one_feature(
     best_acc = -1.0
     best_acc_tiebreak_loss = float("inf")
     best_val_loss = float("inf")
+    best_side_f1 = -1.0
+    best_side_tiebreak_loss = float("inf")
     bad_epochs = 0
     history = []
     for epoch in range(1, args.epochs + 1):
@@ -538,6 +546,13 @@ def train_one_feature(
             and metrics["loss"] < best_acc_tiebreak_loss - 1e-6
         )
         loss_improved = metrics["loss"] < best_val_loss - args.early_min_delta
+        side_improved = "side_macro_f1" in metrics and (
+            metrics["side_macro_f1"] > best_side_f1 + 1e-12
+            or (
+                abs(metrics["side_macro_f1"] - best_side_f1) <= 1e-12
+                and metrics["side_loss"] < best_side_tiebreak_loss - 1e-6
+            )
+        )
         checkpoint = _checkpoint(
             model,
             model_config,
@@ -573,6 +588,16 @@ def train_one_feature(
             saved.append("best loss")
         else:
             bad_epochs += 1
+        if side_improved:
+            best_side_f1 = float(metrics["side_macro_f1"])
+            best_side_tiebreak_loss = float(metrics["side_loss"])
+            torch.save(checkpoint, best_side_path)
+            predictions.to_csv(
+                experiment_dir / "val_predictions_best_side.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+            saved.append("best side")
         status = ", ".join(saved) if saved else "no checkpoint update"
         status += f" | loss patience {bad_epochs}/{args.early_patience}"
         history.append(
@@ -588,6 +613,7 @@ def train_one_feature(
                 "bad_epochs": bad_epochs,
                 "accuracy_improved": accuracy_improved,
                 "loss_improved": loss_improved,
+                "side_improved": side_improved,
                 **metrics,
             }
         )
@@ -613,6 +639,11 @@ def train_one_feature(
 
     best = torch.load(best_path, map_location="cpu", weights_only=True)
     best_loss = torch.load(best_loss_path, map_location="cpu", weights_only=True)
+    best_side = (
+        torch.load(best_side_path, map_location="cpu", weights_only=True)
+        if best_side_path.is_file()
+        else None
+    )
     result = {
         "feature": feature_name,
         "feature_kind": feature_info["feature_kind"],
@@ -627,10 +658,20 @@ def train_one_feature(
         "best_loss_acc_03": best_loss["metrics"]["acc_03"],
         "best_loss_checkpoint": str(best_loss_path),
     }
+    if best_side is not None:
+        result.update(
+            best_side_epoch=best_side["epoch"],
+            best_side_macro_f1=best_side["metrics"]["side_macro_f1"],
+            best_side_accuracy=best_side["metrics"]["side_accuracy"],
+            best_side_checkpoint=str(best_side_path),
+        )
     print(f"{feature_name} | Best accuracy epoch: {best['epoch']}")
     print(f"{feature_name} | Best accuracy metrics: {best['metrics']}")
     print(f"{feature_name} | Best loss epoch: {best_loss['epoch']}")
     print(f"{feature_name} | Best loss metrics: {best_loss['metrics']}")
+    if best_side is not None:
+        print(f"{feature_name} | Best Side epoch: {best_side['epoch']}")
+        print(f"{feature_name} | Best Side metrics: {best_side['metrics']}")
     del model, optimizer, scheduler, scaler, samples, train_samples, val_samples
     gc.collect()
     if device.type == "cuda":
@@ -796,7 +837,14 @@ def main() -> None:
         "loss",
     ]
     if "side_macro_f1" in comparison:
-        summary_columns.extend(["side_accuracy", "side_macro_f1"])
+        summary_columns.extend(
+            [
+                "side_accuracy",
+                "side_macro_f1",
+                "best_side_epoch",
+                "best_side_macro_f1",
+            ]
+        )
     print(comparison[summary_columns].to_string(index=False))
     print(f"Run: {run_dir}")
     print(f"Ranked summary: {run_dir / 'comparison_ranked.csv'}")

@@ -176,6 +176,10 @@ class EntryFeatureCompareTests(unittest.TestCase):
             loaded = entry_model_from_checkpoint(checkpoint)
             self.assertIsInstance(loaded, EntrySideFeatureModel)
             self.assertIn("side_macro_f1", checkpoint["metrics"])
+            self.assertTrue(
+                (run_dir / "spatial_layer3" / "best_side_model.pt").is_file()
+            )
+            self.assertIn("best_side_macro_f1", result)
 
 
 if __name__ == "__main__":

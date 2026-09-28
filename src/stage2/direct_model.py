@@ -53,7 +53,8 @@ class Stage2DirectSpatial(nn.Module):
 
     ``collision_indices`` are supplied by the collision branch at inference.
     During training they come from the directly annotated collision frame, with
-    optional jitter in the training loop.
+    optional jitter in the training loop. A value of -1 means that no collision
+    annotation exists, so the whole-video context is used instead.
     """
 
     def __init__(
@@ -106,13 +107,16 @@ class Stage2DirectSpatial(nn.Module):
     def _collision_context(self, hidden: Tensor, collision_indices: Tensor) -> Tensor:
         batch, steps, _ = hidden.shape
         indices = collision_indices.to(device=hidden.device, dtype=torch.long).reshape(-1)
-        if len(indices) != batch or (indices < 0).any() or (indices >= steps).any():
-            raise ValueError("collision_indices must contain one valid index per video")
+        if len(indices) != batch or (indices < -1).any() or (indices >= steps).any():
+            raise ValueError("collision_indices must contain an index or -1 per video")
         contexts = []
         for batch_index, center in enumerate(indices.tolist()):
-            start = max(0, center - self.collision_window)
-            end = min(steps, center + self.collision_window + 1)
-            contexts.append(hidden[batch_index, start:end].mean(dim=0))
+            if center == -1:
+                contexts.append(hidden[batch_index].mean(dim=0))
+            else:
+                start = max(0, center - self.collision_window)
+                end = min(steps, center + self.collision_window + 1)
+                contexts.append(hidden[batch_index, start:end].mean(dim=0))
         return torch.stack(contexts)
 
     def forward(

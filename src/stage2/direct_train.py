@@ -97,8 +97,6 @@ def _load_sample(row: Any, feature_dir: Path) -> dict[str, Any]:
         evasion = _integer(row.evasion_space, "evasion_space")
         if evasion not in (0, 1):
             raise ValueError(f"Invalid evasion_space for {row.ID}: {evasion}")
-    if evasion is not None and collision_index is None:
-        raise ValueError(f"Evasion label requires collision_frame: {row.ID}")
     if entry_index is None and side is None and evasion is None:
         raise ValueError(f"No usable direct labels: {row.ID}")
     return {
@@ -147,7 +145,9 @@ def _entry_loss_sample(sample: dict[str, Any], device: torch.device) -> dict[str
 
 def _context_index(sample: dict[str, Any], *, jitter: int, rng: np.random.Generator | None) -> int:
     if sample["collision_index"] is None:
-        return len(sample["maps"]) - 1
+        # -1 tells the model to use the whole-video context. This preserves a
+        # valid evasion label even when the collision frame was not annotated.
+        return -1
     index = sample["collision_index"]
     if jitter and rng is not None:
         index += int(rng.integers(-jitter, jitter + 1))
@@ -254,7 +254,7 @@ def evaluate(
         "side_macro_f1": side_f1,
         "evasion_macro_f1": evasion_f1,
         "direct_score_normalized": direct_score,
-        "evasion_context": "ground_truth_collision_frame",
+        "evasion_context": "annotated_collision_or_global_fallback",
     }
     return metrics, predictions
 
@@ -459,7 +459,10 @@ def main() -> None:
     print(f"Best epoch: {best['epoch']}")
     print(f"Best metrics: {best['metrics']}")
     print(f"Checkpoint: {best_path}")
-    print("Caution: validation evasion uses the annotated collision frame; submission uses the collision model prediction.")
+    print(
+        "Caution: validation evasion uses the annotated collision frame when available "
+        "and global context otherwise; submission uses the collision model prediction."
+    )
 
 
 if __name__ == "__main__":

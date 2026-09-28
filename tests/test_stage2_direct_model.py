@@ -46,9 +46,16 @@ class DirectSpatialTests(unittest.TestCase):
     def test_invalid_collision_indices_fail(self):
         model = Stage2DirectSpatial(**self.config)
         maps = torch.randn(1, 7, 8, 4, 6)
-        for indices in (torch.tensor([-1]), torch.tensor([7]), torch.tensor([1, 2])):
+        for indices in (torch.tensor([-2]), torch.tensor([7]), torch.tensor([1, 2])):
             with self.subTest(indices=indices), self.assertRaises(ValueError):
                 model(maps, indices)
+
+    def test_missing_collision_uses_whole_video_context(self):
+        model = Stage2DirectSpatial(**self.config).eval()
+        maps = torch.randn(1, 7, 8, 4, 6)
+        outputs = model(maps, torch.tensor([-1]))
+        self.assertEqual(tuple(outputs["evasion_logits"].shape), (1, 2))
+        self.assertTrue(torch.isfinite(outputs["evasion_logits"]).all())
 
     def test_checkpoint_round_trip(self):
         model = Stage2DirectSpatial(**self.config).eval()

@@ -10,7 +10,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import torch
+
 from build_submit import build_archive, validate_archive, validate_inputs, validate_source
+from src.stage2.collision_predict import collision_model_from_checkpoint
+from src.stage2.direct_model import direct_model_from_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,19 +45,64 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_stage2_checkpoints(
+    collision_path: Path,
+    direct_path: Path,
+) -> tuple[str, dict, dict]:
+    """Fail before packaging when Stage 2 paths point at incompatible files."""
+    collision_checkpoint = torch.load(
+        collision_path, map_location="cpu", weights_only=False
+    )
+    _, collision_format = collision_model_from_checkpoint(collision_checkpoint)
+
+    direct_checkpoint = torch.load(
+        direct_path, map_location="cpu", weights_only=False
+    )
+    required = {"model_config", "model_state_dict"}
+    missing = required - set(direct_checkpoint)
+    if missing:
+        raise ValueError(
+            f"Stage 2 Direct checkpoint is incompatible; missing {sorted(missing)}. "
+            f"Selected file: {direct_path}"
+        )
+    direct_model_from_checkpoint(direct_checkpoint)
+    feature_config = direct_checkpoint.get("feature_config", {})
+    layer = feature_config.get("layer", "layer3")
+    if layer not in {"layer3", "layer4"}:
+        raise ValueError(f"Unsupported Stage 2 Direct feature layer: {layer!r}")
+    expected_channels = 256 if layer == "layer3" else 512
+    actual_channels = int(direct_checkpoint["model_config"]["input_channels"])
+    if actual_channels != expected_channels:
+        raise ValueError(
+            "Stage 2 Direct checkpoint input channels do not match its feature layer: "
+            f"{actual_channels} vs {layer} ({expected_channels})"
+        )
+    return collision_format, collision_checkpoint, direct_checkpoint
+
+
 def main() -> None:
     args = parse_args()
     inference_file = _existing_file(args.inference_file, "inference file")
     requirements_file = _existing_file(args.requirements_file, "requirements file")
     output = args.output.expanduser().resolve()
 
+    stage2_checkpoint = _existing_file(
+        args.stage2_checkpoint, "Stage 2 checkpoint"
+    )
+    stage2_direct_checkpoint = _existing_file(
+        args.stage2_direct_checkpoint, "Stage 2 Direct checkpoint"
+    )
+    collision_format, collision_checkpoint, direct_checkpoint = (
+        _validate_stage2_checkpoints(stage2_checkpoint, stage2_direct_checkpoint)
+    )
+    print(f"Stage 2 collision checkpoint format: {collision_format}")
+    print(f"Stage 2 collision task: {collision_checkpoint.get('task', 'unspecified')}")
+    print(f"Stage 2 Direct task: {direct_checkpoint.get('task', 'unspecified')}")
+
     model_sources = {
         "stage1/best.pt": _existing_file(args.stage1_checkpoint, "Stage 1 checkpoint"),
-        "stage2/best.pt": _existing_file(args.stage2_checkpoint, "Stage 2 checkpoint"),
-        "stage2/direct.pt": _existing_file(
-            args.stage2_direct_checkpoint,
-            "Stage 2 Direct checkpoint",
-        ),
+        "stage2/best.pt": stage2_checkpoint,
+        "stage2/direct.pt": stage2_direct_checkpoint,
         "stage2/resnet18-f37072fd.pth": _existing_file(
             args.stage2_backbone,
             "Stage 2 backbone",

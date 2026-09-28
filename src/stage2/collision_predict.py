@@ -169,6 +169,24 @@ def _video_batches(path: Path, transform, batch_size: int):
 
 
 @torch.inference_mode()
+def extract_video_features(
+    path: Path,
+    backbone: nn.Module,
+    transform,
+    device: torch.device,
+    batch_size: int,
+) -> tuple[torch.Tensor, float]:
+    features = []
+    fps = 0.0
+    for images, fps in _video_batches(path, transform, batch_size):
+        features.append(backbone(images.to(device, non_blocking=True)).float().cpu())
+    if not features:
+        raise RuntimeError(f"No decodable frames: {path}")
+    sequence = torch.cat(features)
+    return sequence, fps
+
+
+@torch.inference_mode()
 def predict_video(
     path: Path,
     backbone: nn.Module,
@@ -177,13 +195,9 @@ def predict_video(
     device: torch.device,
     batch_size: int,
 ) -> tuple[int, int, float, float]:
-    features = []
-    fps = 0.0
-    for images, fps in _video_batches(path, transform, batch_size):
-        features.append(backbone(images.to(device, non_blocking=True)).float().cpu())
-    if not features:
-        raise RuntimeError(f"No decodable frames: {path}")
-    sequence = torch.cat(features)
+    sequence, fps = extract_video_features(
+        path, backbone, transform, device, batch_size
+    )
     logits = temporal(sequence.unsqueeze(0).to(device))
     probabilities = logits.softmax(dim=1)
     predicted_index = int(logits.argmax(dim=1).item())

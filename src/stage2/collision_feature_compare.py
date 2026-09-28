@@ -241,6 +241,8 @@ def train_one_feature(
     experiment_dir = run_dir / feature_name
     experiment_dir.mkdir(parents=True, exist_ok=False)
     best_path = experiment_dir / "best_model.pt"
+    best_accuracy_path = experiment_dir / "best_accuracy_model.pt"
+    best_loss_path = experiment_dir / "best_loss_model.pt"
     config = {
         "feature_name": feature_name,
         "feature_dir": str(feature_dir),
@@ -257,6 +259,14 @@ def train_one_feature(
             "factor": 0.5,
             "patience": 2,
             "min_lr": 1e-6,
+        },
+        "checkpoint_selection": {
+            "best_model.pt": "highest Accuracy@0.3s, then lowest validation loss",
+            "best_accuracy_model.pt": "same checkpoint as best_model.pt",
+            "best_loss_model.pt": "lowest validation loss",
+            "early_stopping": "validation loss",
+            "early_min_delta": args.early_min_delta,
+            "early_patience": args.early_patience,
         },
         "train_ids": [sample["ID"] for sample in train_samples],
         "val_ids": [sample["ID"] for sample in val_samples],
@@ -276,7 +286,10 @@ def train_one_feature(
         f"Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
     )
 
-    best_acc, best_loss, bad_epochs = -1.0, float("inf"), 0
+    best_acc = -1.0
+    best_acc_tiebreak_loss = float("inf")
+    best_val_loss = float("inf")
+    bad_epochs = 0
     history = []
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -306,61 +319,83 @@ def train_one_feature(
 
         metrics, predictions = evaluate(model, val_samples, loss_fn, device, amp)
         scheduler.step(metrics["loss"])
-        improved = metrics["acc_03"] > best_acc + 1e-12 or (
+        next_lr = optimizer.param_groups[0]["lr"]
+
+        accuracy_improved = metrics["acc_03"] > best_acc + 1e-12 or (
             abs(metrics["acc_03"] - best_acc) <= 1e-12
-            and metrics["loss"] < best_loss - 1e-6
+            and metrics["loss"] < best_acc_tiebreak_loss - 1e-6
         )
-        if improved:
-            best_acc, best_loss, bad_epochs = metrics["acc_03"], metrics["loss"], 0
-            torch.save(
-                {
-                    "model_state_dict": {
-                        key: value.detach().cpu()
-                        for key, value in model.state_dict().items()
-                    },
-                    "model_config": model_config,
-                    "feature_name": feature_name,
-                    "feature_config": feature_info["feature_config"],
-                    "loss_config": loss_fn.config,
-                    "epoch": epoch,
-                    "metrics": metrics,
-                    "seed": args.seed,
-                    "task": "collision_frame_feature_compare",
-                },
-                best_path,
-            )
+        loss_improved = metrics["loss"] < best_val_loss - args.early_min_delta
+        checkpoint = {
+            "model_state_dict": {
+                key: value.detach().cpu() for key, value in model.state_dict().items()
+            },
+            "model_config": model_config,
+            "feature_name": feature_name,
+            "feature_config": feature_info["feature_config"],
+            "loss_config": loss_fn.config,
+            "epoch": epoch,
+            "metrics": metrics,
+            "seed": args.seed,
+            "task": "collision_frame_feature_compare",
+        }
+        saved = []
+        if accuracy_improved:
+            best_acc = metrics["acc_03"]
+            best_acc_tiebreak_loss = metrics["loss"]
+            torch.save(checkpoint, best_path)
+            torch.save(checkpoint, best_accuracy_path)
             predictions.to_csv(
                 experiment_dir / "val_predictions.csv",
                 index=False,
                 encoding="utf-8-sig",
             )
-            status = "best saved"
+            saved.append("best accuracy")
+
+        if loss_improved:
+            best_val_loss = metrics["loss"]
+            bad_epochs = 0
+            torch.save(checkpoint, best_loss_path)
+            predictions.to_csv(
+                experiment_dir / "val_predictions_best_loss.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+            saved.append("best loss")
         else:
             bad_epochs += 1
-            status = f"no improvement {bad_epochs}/{args.early_patience}"
+        status = ", ".join(saved) if saved else "no checkpoint update"
+        status += f" | loss patience {bad_epochs}/{args.early_patience}"
 
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": float(np.mean(train_losses)),
                 "lr": lr,
-                "next_lr": optimizer.param_groups[0]["lr"],
+                "next_lr": next_lr,
                 "bad_epochs": bad_epochs,
+                "accuracy_improved": accuracy_improved,
+                "loss_improved": loss_improved,
                 **metrics,
             }
         )
         pd.DataFrame(history).to_csv(experiment_dir / "history.csv", index=False)
         print(
-            f"{feature_name} | Epoch {epoch:02d} | "
+            f"{feature_name} | Epoch {epoch:02d} | LR {lr:.2e} | "
             f"train {history[-1]['train_loss']:.4f} | val {metrics['loss']:.4f} | "
             f"@0.3 {metrics['acc_03']:.1%} | exact {metrics['exact']:.1%} | "
             f"median {metrics['median_sec']:.3f}s | {status}"
         )
+        if next_lr < lr:
+            print(f"{feature_name} | next LR: {next_lr:.2e}")
         if bad_epochs >= args.early_patience:
-            print(f"{feature_name} | Early stopping")
+            print(f"{feature_name} | Early stopping on validation loss")
             break
 
     best = torch.load(best_path, map_location="cpu", weights_only=True)
+    best_loss_checkpoint = torch.load(
+        best_loss_path, map_location="cpu", weights_only=True
+    )
     result = {
         "feature": feature_name,
         "feature_kind": feature_info["feature_kind"],
@@ -369,9 +404,16 @@ def train_one_feature(
         "best_epoch": best["epoch"],
         **best["metrics"],
         "checkpoint": str(best_path),
+        "best_accuracy_checkpoint": str(best_accuracy_path),
+        "best_loss_epoch": best_loss_checkpoint["epoch"],
+        "best_val_loss": best_loss_checkpoint["metrics"]["loss"],
+        "best_loss_acc_03": best_loss_checkpoint["metrics"]["acc_03"],
+        "best_loss_checkpoint": str(best_loss_path),
     }
-    print(f"{feature_name} | Best epoch: {best['epoch']}")
-    print(f"{feature_name} | Best metrics: {best['metrics']}")
+    print(f"{feature_name} | Best accuracy epoch: {best['epoch']}")
+    print(f"{feature_name} | Best accuracy metrics: {best['metrics']}")
+    print(f"{feature_name} | Best loss epoch: {best_loss_checkpoint['epoch']}")
+    print(f"{feature_name} | Best loss metrics: {best_loss_checkpoint['metrics']}")
     del model, optimizer, scheduler, scaler, samples, train_samples, val_samples
     gc.collect()
     if device.type == "cuda":
@@ -399,7 +441,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--early-patience", type=int, default=7)
+    parser.add_argument("--early-patience", type=int, default=10)
+    parser.add_argument("--early-min-delta", type=float, default=1e-4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -415,6 +458,8 @@ def main() -> None:
     args = parse_args()
     if args.epochs < 1 or args.early_patience < 1:
         raise ValueError("epochs and early-patience must be positive")
+    if args.early_min_delta < 0:
+        raise ValueError("early-min-delta cannot be negative")
     labels_path = args.labels.expanduser().resolve()
     feature_root = args.feature_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
@@ -470,6 +515,9 @@ def main() -> None:
                 "exact",
                 "median_sec",
                 "loss",
+                "best_loss_epoch",
+                "best_val_loss",
+                "best_loss_acc_03",
                 "parameters",
             ]
         ].to_string(index=False)

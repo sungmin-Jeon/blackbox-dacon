@@ -37,6 +37,28 @@ class EntryFeatureCompareTests(unittest.TestCase):
         self.assertGreater(inputs.grad.abs().sum().item(), 0)
         self.assertGreater(model.collision_head.weight.grad.abs().sum().item(), 0)
 
+    def test_entry_side_model_can_learn_independent_temporal_attention(self):
+        model = EntrySideFeatureModel(
+            feature_kind="spatial",
+            input_channels=8,
+            projection_size=4,
+            temporal_input_size=6,
+            hidden_size=3,
+            num_layers=1,
+            dropout=0.0,
+            delta_mode="concat",
+            side_context="independent",
+        )
+        inputs = torch.randn(2, 5, 8, 3, 4, requires_grad=True)
+        outputs = model(inputs)
+        self.assertEqual(outputs["side_attention"].shape, (2, 5))
+        torch.testing.assert_close(
+            outputs["side_attention"].sum(dim=1), torch.ones(2)
+        )
+        outputs["side_logits"].square().mean().backward()
+        self.assertGreater(model.side_attention.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(inputs.grad.abs().sum().item(), 0)
+
     def test_loader_preserves_entry_target_prior_and_confidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -126,6 +148,7 @@ class EntryFeatureCompareTests(unittest.TestCase):
                 spatial_coordinates=True,
                 side_loss_weight=0.3,
                 entry_temperature=1.0,
+                side_context="independent",
                 sigma_sec=0.1,
                 lr=2e-4,
                 weight_decay=1e-4,
@@ -149,6 +172,7 @@ class EntryFeatureCompareTests(unittest.TestCase):
             self.assertEqual(checkpoint["model_config"]["delta_mode"], "concat")
             self.assertTrue(checkpoint["model_config"]["spatial_coordinates"])
             self.assertEqual(checkpoint["model_class"], "EntrySideFeatureModel")
+            self.assertEqual(checkpoint["model_config"]["side_context"], "independent")
             loaded = entry_model_from_checkpoint(checkpoint)
             self.assertIsInstance(loaded, EntrySideFeatureModel)
             self.assertIn("side_macro_f1", checkpoint["metrics"])

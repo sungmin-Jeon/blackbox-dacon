@@ -32,13 +32,27 @@ SIDE_TO_INDEX = {"LEFT": 0, "RIGHT": 1}
 class EntrySideFeatureModel(CollisionFeatureModel):
     """Use Entry temporal attention to classify the other vehicle's side."""
 
-    def __init__(self, *, entry_temperature: float = 1.0, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        entry_temperature: float = 1.0,
+        side_context: str = "entry",
+        **kwargs: Any,
+    ) -> None:
         if entry_temperature <= 0:
             raise ValueError("entry_temperature must be positive")
+        if side_context not in {"entry", "independent"}:
+            raise ValueError("side_context must be entry or independent")
         super().__init__(**kwargs)
         self.entry_temperature = entry_temperature
+        self.side_context = side_context
         hidden_size = int(kwargs.get("hidden_size", 64))
         dropout = float(kwargs.get("dropout", 0.3))
+        self.side_attention = (
+            nn.Linear(hidden_size * 2, 1)
+            if side_context == "independent"
+            else None
+        )
         self.side_head = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.GELU(),
@@ -50,11 +64,15 @@ class EntrySideFeatureModel(CollisionFeatureModel):
         hidden = self.encode(features)
         dropped = self.dropout(hidden)
         entry_logits = self.collision_head(dropped).squeeze(-1)
-        entry_weights = (entry_logits / self.entry_temperature).softmax(dim=1)
-        entry_context = torch.bmm(entry_weights.unsqueeze(1), dropped).squeeze(1)
+        if self.side_context == "entry":
+            side_weights = (entry_logits / self.entry_temperature).softmax(dim=1)
+        else:
+            side_weights = self.side_attention(dropped).squeeze(-1).softmax(dim=1)
+        side_context = torch.bmm(side_weights.unsqueeze(1), dropped).squeeze(1)
         return {
             "entry_logits": entry_logits,
-            "side_logits": self.side_head(entry_context),
+            "side_logits": self.side_head(side_context),
+            "side_attention": side_weights,
         }
 
 
@@ -390,6 +408,7 @@ def train_one_feature(
                 f"{missing_side[:10]}"
             )
         model_config["entry_temperature"] = args.entry_temperature
+        model_config["side_context"] = args.side_context
         model: nn.Module = EntrySideFeatureModel(**model_config).to(device)
         model_class = "EntrySideFeatureModel"
     else:
@@ -420,6 +439,7 @@ def train_one_feature(
             "enabled": side_loss_weight > 0,
             "weight": side_loss_weight,
             "entry_temperature": args.entry_temperature,
+            "side_context": args.side_context,
             "side_to_index": SIDE_TO_INDEX,
         },
         "optimizer": {
@@ -451,7 +471,7 @@ def train_one_feature(
         f"Feature: {feature_name} | kind={feature_info['feature_kind']} | "
         f"channels={feature_info['input_channels']} | delta={args.delta_mode} | "
         f"spatial coordinates={args.spatial_coordinates} | "
-        f"side loss weight={side_loss_weight}"
+        f"side loss weight={side_loss_weight} | side context={args.side_context}"
     )
     print(
         f"Train: {len(train_samples)} | Val: {len(val_samples)} | "
@@ -654,6 +674,15 @@ def parse_args() -> argparse.Namespace:
         help="enable the Entry-side auxiliary head with this loss weight",
     )
     parser.add_argument("--entry-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--side-context",
+        choices=("entry", "independent"),
+        default="entry",
+        help=(
+            "entry reuses Entry temporal weights; independent learns separate "
+            "temporal attention for Side"
+        ),
+    )
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-patience", type=int, default=10)
@@ -704,7 +733,7 @@ def main() -> None:
     print(f"Spatial coordinates: {args.spatial_coordinates}")
     print(
         f"Side auxiliary: weight={args.side_loss_weight} | "
-        f"entry temperature={args.entry_temperature}"
+        f"entry temperature={args.entry_temperature} | context={args.side_context}"
     )
 
     output_root = args.output_root.expanduser().resolve()

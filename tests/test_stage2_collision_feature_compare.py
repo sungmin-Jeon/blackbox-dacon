@@ -60,6 +60,37 @@ class CollisionFeatureCompareTests(unittest.TestCase):
                 )
                 self.assertEqual(model(inputs).shape, (2, 5))
 
+    def test_dual_branch_backpropagates_through_both_spatial_pools(self):
+        model = CollisionFeatureModel(
+            feature_kind="spatial",
+            input_channels=8,
+            projection_size=4,
+            temporal_input_size=6,
+            hidden_size=3,
+            num_layers=1,
+            dropout=0.0,
+            delta_mode="dual",
+        )
+        inputs = torch.randn(2, 5, 8, 3, 4, requires_grad=True)
+        outputs = model(inputs)
+        self.assertEqual(outputs.shape, (2, 5))
+        outputs.square().mean().backward()
+        self.assertIsNotNone(model.appearance_project.project[0].weight.grad)
+        self.assertIsNotNone(model.motion_project.project[0].weight.grad)
+        self.assertGreater(
+            model.appearance_project.project[0].weight.grad.abs().sum().item(), 0
+        )
+        self.assertGreater(
+            model.motion_project.project[0].weight.grad.abs().sum().item(), 0
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires spatial"):
+            CollisionFeatureModel(
+                feature_kind="global",
+                input_channels=8,
+                delta_mode="dual",
+            )
+
     def test_loader_detects_feature_kind_and_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

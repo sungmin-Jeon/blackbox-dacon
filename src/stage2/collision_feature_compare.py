@@ -42,12 +42,35 @@ class CollisionFeatureModel(nn.Module):
         super().__init__()
         if feature_kind not in {"global", "spatial"}:
             raise ValueError("feature_kind must be global or spatial")
-        if delta_mode not in {"none", "concat"}:
-            raise ValueError("delta_mode must be none or concat")
+        if delta_mode not in {"none", "concat", "dual"}:
+            raise ValueError("delta_mode must be none, concat or dual")
+        if delta_mode == "dual" and feature_kind != "spatial":
+            raise ValueError("delta_mode=dual requires spatial features")
         self.feature_kind = feature_kind
         self.delta_mode = delta_mode
-        projected_channels = input_channels * (2 if delta_mode == "concat" else 1)
-        if feature_kind == "global":
+        if delta_mode == "dual":
+            self.appearance_project = SpatialAttentionPool(
+                input_channels=input_channels,
+                projection_size=projection_size,
+                output_size=temporal_input_size,
+                dropout=dropout,
+            )
+            self.motion_project = SpatialAttentionPool(
+                input_channels=input_channels,
+                projection_size=projection_size,
+                output_size=temporal_input_size,
+                dropout=dropout,
+            )
+            self.branch_fuse = nn.Sequential(
+                nn.Linear(temporal_input_size * 2, temporal_input_size),
+                nn.LayerNorm(temporal_input_size),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+        elif feature_kind == "global":
+            projected_channels = input_channels * (
+                2 if delta_mode == "concat" else 1
+            )
             self.project = nn.Sequential(
                 nn.Linear(projected_channels, temporal_input_size),
                 nn.LayerNorm(temporal_input_size),
@@ -55,6 +78,9 @@ class CollisionFeatureModel(nn.Module):
                 nn.Dropout(dropout),
             )
         else:
+            projected_channels = input_channels * (
+                2 if delta_mode == "concat" else 1
+            )
             self.project = SpatialAttentionPool(
                 input_channels=projected_channels,
                 projection_size=projection_size,
@@ -90,13 +116,21 @@ class CollisionFeatureModel(nn.Module):
             if features.ndim != 5:
                 raise ValueError("Spatial features must have shape [B,T,C,H,W]")
 
-        if self.delta_mode == "concat":
+        if self.delta_mode == "dual":
+            delta = self.temporal_delta(features)
+            appearance, _ = self.appearance_project(features)
+            motion, _ = self.motion_project(delta)
+            vectors = self.branch_fuse(torch.cat([appearance, motion], dim=-1))
+        elif self.delta_mode == "concat":
             features = torch.cat(
                 [features, self.temporal_delta(features)],
                 dim=2,
             )
-
-        if self.feature_kind == "global":
+            if self.feature_kind == "global":
+                vectors = self.project(features)
+            else:
+                vectors, _ = self.project(features)
+        elif self.feature_kind == "global":
             vectors = self.project(features)
         else:
             vectors, _ = self.project(features)
@@ -466,9 +500,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument(
         "--delta-mode",
-        choices=("none", "concat"),
+        choices=("none", "concat", "dual"),
         default="none",
-        help="concat appends signed feature[t]-feature[t-1] along channels",
+        help=(
+            "concat appends signed deltas along channels; dual uses independent "
+            "spatial-attention branches for appearance and signed deltas"
+        ),
     )
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)

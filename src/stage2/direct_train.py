@@ -168,10 +168,22 @@ def _combined_loss(
         terms.append(("entry", entry_loss_fn(outputs["entry_logits"], _entry_loss_sample(sample, device)), weights["entry"]))
     if sample["side"] is not None:
         target = torch.tensor([sample["side"]], device=device)
-        terms.append(("side", side_loss_fn(outputs["side_logits"], target), weights["side"]))
+        terms.append(
+            (
+                "side",
+                side_loss_fn(outputs["side_logits"], target).mean(),
+                weights["side"],
+            )
+        )
     if sample["evasion"] is not None:
         target = torch.tensor([sample["evasion"]], device=device)
-        terms.append(("evasion", evasion_loss_fn(outputs["evasion_logits"], target), weights["evasion"]))
+        terms.append(
+            (
+                "evasion",
+                evasion_loss_fn(outputs["evasion_logits"], target).mean(),
+                weights["evasion"],
+            )
+        )
     if not terms:
         raise ValueError(f"No active loss for {sample['ID']}")
     total_weight = sum(weight for _, _, weight in terms)
@@ -335,8 +347,11 @@ def main() -> None:
     entry_loss_fn = make_temporal_loss(args.entry_loss, **entry_options)
     side_weight = _class_weights(train_samples, "side", device) if args.class_balance else None
     evasion_weight = _class_weights(train_samples, "evasion", device) if args.class_balance else None
-    side_loss_fn = nn.CrossEntropyLoss(weight=side_weight)
-    evasion_loss_fn = nn.CrossEntropyLoss(weight=evasion_weight)
+    # reduction="none" is required here. With one video per optimizer step,
+    # CrossEntropyLoss(weight=..., reduction="mean") divides by the target
+    # class weight and silently cancels class balancing.
+    side_loss_fn = nn.CrossEntropyLoss(weight=side_weight, reduction="none")
+    evasion_loss_fn = nn.CrossEntropyLoss(weight=evasion_weight, reduction="none")
     loss_weights = {"entry": args.entry_weight, "side": args.side_weight, "evasion": args.evasion_weight}
     if any(weight <= 0 for weight in loss_weights.values()):
         raise ValueError("All task loss weights must be positive")
@@ -359,6 +374,14 @@ def main() -> None:
         "entry_loss": entry_loss_fn.config,
         "task_loss_weights": loss_weights,
         "class_balance": args.class_balance,
+        "class_weights": {
+            "side": side_weight.detach().cpu().tolist() if side_weight is not None else None,
+            "evasion": (
+                evasion_weight.detach().cpu().tolist()
+                if evasion_weight is not None
+                else None
+            ),
+        },
         "collision_jitter": args.collision_jitter,
         "optimizer": {"name": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
         "scheduler": {"name": "ReduceLROnPlateau", "factor": 0.5, "patience": 2, "min_lr": 1e-6},
@@ -377,6 +400,7 @@ def main() -> None:
     print(f"Device: {device} | AMP: {amp}")
     print(f"Train: {len(train_samples)} | Val: {len(val_samples)}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"Class weights: {experiment_config['class_weights']}")
     print(f"Run: {run_dir}")
 
     best_score, best_loss, bad_epochs = -float("inf"), float("inf"), 0

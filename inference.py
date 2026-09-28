@@ -510,7 +510,7 @@ class _Stage2CollisionBiGRU(nn.Module):
             num_layers,
             batch_first=True,
             bidirectional=True,
-            dropout=dropout,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
         self.dropout = nn.Dropout(dropout)
         self.collision_head = nn.Linear(hidden_size * 2, 1)
@@ -518,6 +518,89 @@ class _Stage2CollisionBiGRU(nn.Module):
     def forward(self, inputs: torch.Tensor):
         hidden, _ = self.gru(inputs)
         return self.collision_head(self.dropout(hidden)).squeeze(-1)
+
+
+class _Stage2BaselineCollisionBiGRU(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int) -> None:
+        super().__init__()
+        self.r = nn.GRU(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.15 if num_layers > 1 else 0.0,
+        )
+        self.tc = nn.Linear(hidden_size * 2, 1)
+
+    def forward(self, inputs: torch.Tensor):
+        hidden, _ = self.r(inputs)
+        return self.tc(hidden).squeeze(-1)
+
+
+def _stage2_checkpoint_state(checkpoint):
+    for key in ("model_state_dict", "model", "state_dict"):
+        if key in checkpoint:
+            state = checkpoint[key]
+            break
+    else:
+        if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+            state = checkpoint
+        else:
+            raise ValueError("Stage 2 collision checkpoint has no model state dictionary")
+    return {
+        (name.removeprefix("module.")): value
+        for name, value in state.items()
+    }
+
+
+def _stage2_gru_dimensions(state, prefix):
+    input_key = f"{prefix}.weight_ih_l0"
+    hidden_key = f"{prefix}.weight_hh_l0"
+    if input_key not in state or hidden_key not in state:
+        raise ValueError(f"Missing GRU weights for prefix {prefix}")
+    input_size = int(state[input_key].shape[1])
+    hidden_size = int(state[hidden_key].shape[1])
+    layer_pattern = re.compile(rf"^{re.escape(prefix)}\.weight_ih_l(\d+)$")
+    layers = [int(match.group(1)) for key in state if (match := layer_pattern.match(key))]
+    if not layers:
+        raise ValueError(f"Cannot infer GRU layers for prefix {prefix}")
+    return input_size, hidden_size, max(layers) + 1
+
+
+def _stage2_collision_model_from_checkpoint(checkpoint):
+    state = _stage2_checkpoint_state(checkpoint)
+    if "gru.weight_ih_l0" in state and "collision_head.weight" in state:
+        input_size, hidden_size, num_layers = _stage2_gru_dimensions(state, "gru")
+        model = _Stage2CollisionBiGRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=float(checkpoint.get("dropout", 0.3)),
+        )
+        model.load_state_dict(
+            {
+                key: value
+                for key, value in state.items()
+                if key.startswith("gru.") or key.startswith("collision_head.")
+            }
+        )
+        return model, "collision_v0"
+    if "r.weight_ih_l0" in state and "tc.weight" in state:
+        input_size, hidden_size, num_layers = _stage2_gru_dimensions(state, "r")
+        model = _Stage2BaselineCollisionBiGRU(input_size, hidden_size, num_layers)
+        model.load_state_dict(
+            {
+                key: value
+                for key, value in state.items()
+                if key.startswith("r.") or key.startswith("tc.")
+            }
+        )
+        return model, "baseline"
+    raise ValueError(
+        "Unsupported Stage 2 collision checkpoint keys: "
+        f"{list(state)[:10]}"
+    )
 
 
 class _Stage2SpatialAttentionPool(nn.Module):
@@ -676,13 +759,7 @@ def predict_stage2(data_dir, model_dir):
     backbone.to(device).eval()
 
     checkpoint = torch.load(model_dir / "best.pt", map_location="cpu", weights_only=False)
-    collision_model = _Stage2CollisionBiGRU(
-        input_size=int(checkpoint.get("input_size", 512)),
-        hidden_size=int(checkpoint.get("hidden_size", 192)),
-        num_layers=int(checkpoint.get("num_layers", 2)),
-        dropout=float(checkpoint.get("dropout", 0.3)),
-    )
-    collision_model.load_state_dict(checkpoint["model_state_dict"])
+    collision_model, _ = _stage2_collision_model_from_checkpoint(checkpoint)
     collision_model.to(device).eval()
 
     direct_checkpoint = torch.load(

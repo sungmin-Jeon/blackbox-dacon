@@ -44,6 +44,90 @@ class CollisionBiGRU(nn.Module):
         return self.collision_head(self.dropout(hidden)).squeeze(-1)
 
 
+class BaselineCollisionBiGRU(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int) -> None:
+        super().__init__()
+        self.r = nn.GRU(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.15 if num_layers > 1 else 0.0,
+        )
+        self.tc = nn.Linear(hidden_size * 2, 1)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden, _ = self.r(inputs)
+        return self.tc(hidden).squeeze(-1)
+
+
+def _checkpoint_state(checkpoint: dict) -> dict[str, torch.Tensor]:
+    for key in ("model_state_dict", "model", "state_dict"):
+        if key in checkpoint:
+            state = checkpoint[key]
+            break
+    else:
+        if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+            state = checkpoint
+        else:
+            raise ValueError("Collision checkpoint has no model state dictionary")
+    return {
+        name.removeprefix("module."): value
+        for name, value in state.items()
+    }
+
+
+def _gru_dimensions(state: dict[str, torch.Tensor], prefix: str) -> tuple[int, int, int]:
+    input_key = f"{prefix}.weight_ih_l0"
+    hidden_key = f"{prefix}.weight_hh_l0"
+    if input_key not in state or hidden_key not in state:
+        raise ValueError(f"Missing GRU weights for prefix {prefix}")
+    input_size = int(state[input_key].shape[1])
+    hidden_size = int(state[hidden_key].shape[1])
+    layer_prefix = f"{prefix}.weight_ih_l"
+    layers = [
+        int(key[len(layer_prefix):])
+        for key in state
+        if key.startswith(layer_prefix) and key[len(layer_prefix):].isdigit()
+    ]
+    if not layers:
+        raise ValueError(f"Cannot infer GRU layers for prefix {prefix}")
+    return input_size, hidden_size, max(layers) + 1
+
+
+def collision_model_from_checkpoint(checkpoint: dict) -> tuple[nn.Module, str]:
+    state = _checkpoint_state(checkpoint)
+    if "gru.weight_ih_l0" in state and "collision_head.weight" in state:
+        input_size, hidden_size, num_layers = _gru_dimensions(state, "gru")
+        model = CollisionBiGRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=float(checkpoint.get("dropout", 0.3)),
+        )
+        model.load_state_dict(
+            {
+                key: value
+                for key, value in state.items()
+                if key.startswith("gru.") or key.startswith("collision_head.")
+            }
+        )
+        return model, "collision_v0"
+    if "r.weight_ih_l0" in state and "tc.weight" in state:
+        input_size, hidden_size, num_layers = _gru_dimensions(state, "r")
+        model = BaselineCollisionBiGRU(input_size, hidden_size, num_layers)
+        model.load_state_dict(
+            {
+                key: value
+                for key, value in state.items()
+                if key.startswith("r.") or key.startswith("tc.")
+            }
+        )
+        return model, "baseline"
+    raise ValueError(f"Unsupported collision checkpoint keys: {list(state)[:10]}")
+
+
 def _video_index(root: Path) -> dict[str, Path]:
     paths = sorted(
         path
@@ -156,14 +240,9 @@ def main() -> None:
         map_location="cpu",
         weights_only=False,
     )
-    temporal = CollisionBiGRU(
-        input_size=int(checkpoint.get("input_size", 512)),
-        hidden_size=int(checkpoint.get("hidden_size", 192)),
-        num_layers=int(checkpoint.get("num_layers", 2)),
-        dropout=float(checkpoint.get("dropout", 0.3)),
-    )
-    temporal.load_state_dict(checkpoint["model_state_dict"])
+    temporal, checkpoint_format = collision_model_from_checkpoint(checkpoint)
     temporal.to(device).eval().requires_grad_(False)
+    print(f"Collision checkpoint format: {checkpoint_format}")
     transform = ResNet18_Weights.IMAGENET1K_V1.transforms()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

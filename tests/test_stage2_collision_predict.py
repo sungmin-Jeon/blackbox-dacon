@@ -9,8 +9,16 @@ import numpy as np
 import torch
 from torchvision.models import ResNet18_Weights, resnet18
 
-from inference import _Stage2CollisionBiGRU
-from src.stage2.collision_predict import CollisionBiGRU, predict_video
+from inference import (
+    _Stage2CollisionBiGRU,
+    _stage2_collision_model_from_checkpoint,
+)
+from src.stage2.collision_predict import (
+    BaselineCollisionBiGRU,
+    CollisionBiGRU,
+    collision_model_from_checkpoint,
+    predict_video,
+)
 
 
 class CollisionContextPredictionTests(unittest.TestCase):
@@ -25,6 +33,34 @@ class CollisionContextPredictionTests(unittest.TestCase):
         context.load_state_dict(submitted.state_dict())
         features = torch.randn(1, 6, 8)
         torch.testing.assert_close(context(features), submitted(features))
+
+    def test_both_checkpoint_formats_are_detected(self):
+        features = torch.randn(1, 6, 8)
+        cases = [
+            (
+                CollisionBiGRU(8, 4, 1, 0.0).eval(),
+                "model_state_dict",
+                "collision_v0",
+            ),
+            (
+                BaselineCollisionBiGRU(8, 4, 2).eval(),
+                "model",
+                "baseline",
+            ),
+        ]
+        for original, checkpoint_key, expected_format in cases:
+            with self.subTest(expected_format=expected_format):
+                checkpoint = {checkpoint_key: original.state_dict()}
+                restored, actual_format = collision_model_from_checkpoint(checkpoint)
+                submitted, submitted_format = _stage2_collision_model_from_checkpoint(
+                    checkpoint
+                )
+                self.assertEqual(actual_format, expected_format)
+                self.assertEqual(submitted_format, expected_format)
+                restored.eval()
+                submitted.eval()
+                torch.testing.assert_close(restored(features), original(features))
+                torch.testing.assert_close(submitted(features), original(features))
 
     def test_video_prediction_returns_one_based_frame(self):
         with tempfile.TemporaryDirectory() as directory:

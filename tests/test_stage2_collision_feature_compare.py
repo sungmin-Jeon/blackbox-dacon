@@ -13,9 +13,20 @@ from src.stage2.collision_feature_compare import (
     load_feature_samples,
     train_one_feature,
 )
+from src.stage2.direct_model import SpatialAttentionPool
 
 
 class CollisionFeatureCompareTests(unittest.TestCase):
+    def test_attention_coordinate_features_for_uniform_map(self):
+        weights = torch.full((1, 1, 4), 0.25)
+        coordinates = SpatialAttentionPool.attention_coordinate_features(
+            weights, height=2, width=2
+        )
+        expected = torch.tensor(
+            [[0.0, 0.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5]]
+        )
+        torch.testing.assert_close(coordinates, expected, atol=1e-5, rtol=1e-5)
+
     def test_global_and_spatial_models_return_frame_logits(self):
         cases = [
             ("global", 512, torch.randn(2, 5, 512)),
@@ -59,6 +70,32 @@ class CollisionFeatureCompareTests(unittest.TestCase):
                     delta_mode="concat",
                 )
                 self.assertEqual(model(inputs).shape, (2, 5))
+
+    def test_spatial_coordinate_model_returns_logits_and_backpropagates(self):
+        model = CollisionFeatureModel(
+            feature_kind="spatial",
+            input_channels=8,
+            projection_size=4,
+            temporal_input_size=6,
+            hidden_size=3,
+            num_layers=1,
+            dropout=0.0,
+            delta_mode="concat",
+            spatial_coordinates=True,
+        )
+        inputs = torch.randn(2, 5, 8, 3, 4, requires_grad=True)
+        outputs = model(inputs)
+        self.assertEqual(outputs.shape, (2, 5))
+        outputs.square().mean().backward()
+        self.assertGreater(inputs.grad.abs().sum().item(), 0)
+        self.assertEqual(model.project.fuse[0].in_features, 16)
+
+        with self.assertRaisesRegex(ValueError, "requires spatial"):
+            CollisionFeatureModel(
+                feature_kind="global",
+                input_channels=8,
+                spatial_coordinates=True,
+            )
 
     def test_dual_branch_backpropagates_through_both_spatial_pools(self):
         model = CollisionFeatureModel(

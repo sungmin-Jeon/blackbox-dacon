@@ -99,6 +99,7 @@ class EntryFeatureCompareTests(unittest.TestCase):
                 num_layers=1,
                 dropout=0.0,
                 delta_mode="concat",
+                spatial_coordinates=True,
                 sigma_sec=0.1,
                 lr=2e-4,
                 weight_decay=1e-4,
@@ -120,6 +121,7 @@ class EntryFeatureCompareTests(unittest.TestCase):
                 result["checkpoint"], map_location="cpu", weights_only=True
             )
             self.assertEqual(checkpoint["model_config"]["delta_mode"], "concat")
+            self.assertTrue(checkpoint["model_config"]["spatial_coordinates"])
 
 
 if __name__ == "__main__":

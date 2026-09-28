@@ -38,6 +38,7 @@ class CollisionFeatureModel(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.3,
         delta_mode: str = "none",
+        spatial_coordinates: bool = False,
     ) -> None:
         super().__init__()
         if feature_kind not in {"global", "spatial"}:
@@ -46,20 +47,25 @@ class CollisionFeatureModel(nn.Module):
             raise ValueError("delta_mode must be none, concat or dual")
         if delta_mode == "dual" and feature_kind != "spatial":
             raise ValueError("delta_mode=dual requires spatial features")
+        if spatial_coordinates and feature_kind != "spatial":
+            raise ValueError("spatial_coordinates requires spatial features")
         self.feature_kind = feature_kind
         self.delta_mode = delta_mode
+        self.spatial_coordinates = spatial_coordinates
         if delta_mode == "dual":
             self.appearance_project = SpatialAttentionPool(
                 input_channels=input_channels,
                 projection_size=projection_size,
                 output_size=temporal_input_size,
                 dropout=dropout,
+                include_coordinates=spatial_coordinates,
             )
             self.motion_project = SpatialAttentionPool(
                 input_channels=input_channels,
                 projection_size=projection_size,
                 output_size=temporal_input_size,
                 dropout=dropout,
+                include_coordinates=spatial_coordinates,
             )
             self.branch_fuse = nn.Sequential(
                 nn.Linear(temporal_input_size * 2, temporal_input_size),
@@ -86,6 +92,7 @@ class CollisionFeatureModel(nn.Module):
                 projection_size=projection_size,
                 output_size=temporal_input_size,
                 dropout=dropout,
+                include_coordinates=spatial_coordinates,
             )
         self.temporal = nn.GRU(
             temporal_input_size,

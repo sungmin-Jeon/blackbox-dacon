@@ -17,8 +17,10 @@ class SpatialAttentionPool(nn.Module):
         projection_size: int = 128,
         output_size: int = 256,
         dropout: float = 0.2,
+        include_coordinates: bool = False,
     ) -> None:
         super().__init__()
+        self.include_coordinates = include_coordinates
         self.project = nn.Sequential(
             nn.Conv2d(input_channels, projection_size, kernel_size=1),
             nn.GELU(),
@@ -28,11 +30,68 @@ class SpatialAttentionPool(nn.Module):
             nn.GELU(),
             nn.Conv2d(max(16, projection_size // 2), 1, kernel_size=1),
         )
+        coordinate_size = 8 if include_coordinates else 0
         self.fuse = nn.Sequential(
-            nn.Linear(projection_size * 2, output_size),
+            nn.Linear(projection_size * 2 + coordinate_size, output_size),
             nn.LayerNorm(output_size),
             nn.GELU(),
             nn.Dropout(dropout),
+        )
+
+    @staticmethod
+    def attention_coordinate_features(
+        weights: Tensor,
+        height: int,
+        width: int,
+    ) -> Tensor:
+        """Summarize where each attention map is concentrated.
+
+        The returned values are ``mean_x, mean_y, std_x, std_y`` followed by
+        attention mass in the left, right, top and bottom halves. Coordinates
+        use the resolution-independent range [-1, 1].
+        """
+
+        if weights.ndim != 3 or weights.shape[1] != 1:
+            raise ValueError("weights must have shape [N, 1, H*W]")
+        if height < 1 or width < 1 or weights.shape[2] != height * width:
+            raise ValueError("Attention shape does not match height and width")
+        y_axis = torch.linspace(
+            -1.0, 1.0, height, device=weights.device, dtype=weights.dtype
+        )
+        x_axis = torch.linspace(
+            -1.0, 1.0, width, device=weights.device, dtype=weights.dtype
+        )
+        yy, xx = torch.meshgrid(y_axis, x_axis, indexing="ij")
+        xx = xx.flatten().unsqueeze(0)
+        yy = yy.flatten().unsqueeze(0)
+        flat_weights = weights.squeeze(1)
+
+        mean_x = (flat_weights * xx).sum(dim=1)
+        mean_y = (flat_weights * yy).sum(dim=1)
+        std_x = torch.sqrt(
+            (flat_weights * (xx - mean_x.unsqueeze(1)).square()).sum(dim=1)
+            + 1e-6
+        )
+        std_y = torch.sqrt(
+            (flat_weights * (yy - mean_y.unsqueeze(1)).square()).sum(dim=1)
+            + 1e-6
+        )
+        left_mass = (flat_weights * (xx < 0).to(flat_weights.dtype)).sum(dim=1)
+        right_mass = (flat_weights * (xx >= 0).to(flat_weights.dtype)).sum(dim=1)
+        top_mass = (flat_weights * (yy < 0).to(flat_weights.dtype)).sum(dim=1)
+        bottom_mass = (flat_weights * (yy >= 0).to(flat_weights.dtype)).sum(dim=1)
+        return torch.stack(
+            [
+                mean_x,
+                mean_y,
+                std_x,
+                std_y,
+                left_mass,
+                right_mass,
+                top_mass,
+                bottom_mass,
+            ],
+            dim=1,
         )
 
     def forward(self, maps: Tensor) -> tuple[Tensor, Tensor]:
@@ -44,7 +103,12 @@ class SpatialAttentionPool(nn.Module):
         weights = self.attention(projected).flatten(2).softmax(dim=-1)
         local = torch.bmm(projected.flatten(2), weights.transpose(1, 2)).squeeze(-1)
         global_scene = projected.mean(dim=(-2, -1))
-        vectors = self.fuse(torch.cat([local, global_scene], dim=-1))
+        parts = [local, global_scene]
+        if self.include_coordinates:
+            parts.append(
+                self.attention_coordinate_features(weights, height, width)
+            )
+        vectors = self.fuse(torch.cat(parts, dim=-1))
         return vectors.reshape(batch, steps, -1), weights.reshape(batch, steps, height, width)
 
 

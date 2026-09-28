@@ -270,6 +270,7 @@ def train_one_feature(
         "num_layers": args.num_layers,
         "dropout": args.dropout,
         "delta_mode": args.delta_mode,
+        "spatial_coordinates": args.spatial_coordinates,
     }
     model = CollisionFeatureModel(**model_config).to(device)
     loss_fn = make_temporal_loss("gaussian_ce", sigma_sec=args.sigma_sec)
@@ -319,7 +320,8 @@ def train_one_feature(
     print("=" * 88)
     print(
         f"Feature: {feature_name} | kind={feature_info['feature_kind']} | "
-        f"channels={feature_info['input_channels']} | delta={args.delta_mode}"
+        f"channels={feature_info['input_channels']} | delta={args.delta_mode} | "
+        f"spatial coordinates={args.spatial_coordinates}"
     )
     print(
         f"Train: {len(train_samples)} | Val: {len(val_samples)} | "
@@ -473,6 +475,14 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="concat appends signed feature[t]-feature[t-1] along channels",
     )
+    parser.add_argument(
+        "--spatial-coordinates",
+        action="store_true",
+        help=(
+            "append attention mean x/y, spread and half-screen masses before "
+            "the temporal model; spatial feature banks only"
+        ),
+    )
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-patience", type=int, default=10)
@@ -516,6 +526,7 @@ def main() -> None:
         f"median {selected_prior_metrics['median_sec']:.3f}s"
     )
     print(f"Features: {args.features} | Delta: {args.delta_mode} | Loss: gaussian_ce")
+    print(f"Spatial coordinates: {args.spatial_coordinates}")
 
     output_root = args.output_root.expanduser().resolve()
     feature_root = args.feature_root.expanduser().resolve()

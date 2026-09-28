@@ -41,7 +41,7 @@ def _frame_index(frames: Tensor, value: Any, name: str) -> int:
     return int(matches.item())
 
 
-def _load_labels(path: Path) -> pd.DataFrame:
+def _load_labels(path: Path, collision_predictions_path: Path | None = None) -> pd.DataFrame:
     labels = pd.read_csv(path, dtype={"ID": str})
     required = {"ID", "split", "entry_side", "evasion_space"}
     missing = required - set(labels.columns)
@@ -63,6 +63,32 @@ def _load_labels(path: Path) -> pd.DataFrame:
         raise ValueError(f"Duplicate IDs in labels: {duplicates[:10]}")
     if not {"train", "val"}.issubset(set(labels["split"])):
         raise ValueError("Both train and val splits are required")
+    if collision_predictions_path is not None:
+        predictions = pd.read_csv(collision_predictions_path, dtype={"ID": str})
+        required_predictions = {"ID", "collision_pred_frame"}
+        missing_predictions = required_predictions - set(predictions.columns)
+        if missing_predictions:
+            raise ValueError(
+                f"Missing collision prediction columns: {sorted(missing_predictions)}"
+            )
+        if predictions["ID"].duplicated().any():
+            raise ValueError("Collision predictions contain duplicate IDs")
+        if "collision_pred_frame" in labels:
+            labels = labels.drop(columns=["collision_pred_frame"])
+        labels = labels.merge(
+            predictions[["ID", "collision_pred_frame"]],
+            on="ID",
+            how="left",
+            validate="one_to_one",
+        )
+        missing_ids = labels.loc[
+            ~labels["collision_pred_frame"].map(_present), "ID"
+        ].tolist()
+        if missing_ids:
+            raise ValueError(
+                f"Missing collision predictions for {len(missing_ids)} IDs: "
+                f"{missing_ids[:10]}"
+            )
     return labels.reset_index(drop=True)
 
 
@@ -86,6 +112,12 @@ def _load_sample(row: Any, feature_dir: Path) -> dict[str, Any]:
         _frame_index(frames, row.collision_frame, "collision_frame")
         if _present(row.collision_frame) else None
     )
+    collision_pred_frame = getattr(row, "collision_pred_frame", None)
+    collision_pred_index = (
+        _frame_index(frames, collision_pred_frame, "collision_pred_frame")
+        if _present(collision_pred_frame)
+        else None
+    )
     side = None
     if _present(row.entry_side):
         side_name = str(row.entry_side).strip().upper()
@@ -108,6 +140,7 @@ def _load_sample(row: Any, feature_dir: Path) -> dict[str, Any]:
         "entry_index": entry_index,
         "entry_frame": int(frames[entry_index]) if entry_index is not None else None,
         "collision_index": collision_index,
+        "collision_pred_index": collision_pred_index,
         "side": side,
         "evasion": evasion,
     }
@@ -143,12 +176,34 @@ def _entry_loss_sample(sample: dict[str, Any], device: torch.device) -> dict[str
     }
 
 
-def _context_index(sample: dict[str, Any], *, jitter: int, rng: np.random.Generator | None) -> int:
-    if sample["collision_index"] is None:
-        # -1 tells the model to use the whole-video context. This preserves a
-        # valid evasion label even when the collision frame was not annotated.
+def _context_index(
+    sample: dict[str, Any],
+    *,
+    source: str,
+    jitter: int,
+    rng: np.random.Generator | None,
+    ground_truth_probability: float = 0.5,
+) -> int:
+    if source not in {"annotated", "predicted", "mixed"}:
+        raise ValueError(f"Unknown collision context source: {source}")
+    annotated = sample["collision_index"]
+    predicted = sample["collision_pred_index"]
+    if source == "annotated":
+        index = annotated
+    elif source == "predicted":
+        index = predicted
+    elif annotated is None:
+        index = predicted
+    elif predicted is None:
+        index = annotated
+    else:
+        if rng is None:
+            raise ValueError("mixed collision context requires an RNG")
+        index = annotated if rng.random() < ground_truth_probability else predicted
+    if index is None:
+        # -1 tells the model to use the whole-video context. This is retained
+        # for V1 compatibility when no prediction CSV is supplied.
         return -1
-    index = sample["collision_index"]
     if jitter and rng is not None:
         index += int(rng.integers(-jitter, jitter + 1))
     return min(max(index, 0), len(sample["maps"]) - 1)
@@ -201,20 +256,35 @@ def evaluate(
     loss_weights: dict[str, float],
     device: torch.device,
     amp: bool,
+    collision_context_source: str,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     model.eval()
     losses = []
     rows = []
     for sample in samples:
         maps = sample["maps"].unsqueeze(0).to(device=device, dtype=torch.float32)
-        collision_index = _context_index(sample, jitter=0, rng=None)
+        collision_index = _context_index(
+            sample,
+            source=collision_context_source,
+            jitter=0,
+            rng=None,
+        )
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
             outputs = model(maps, torch.tensor([collision_index], device=device))
             loss, _ = _combined_loss(
                 outputs, sample, entry_loss_fn, side_loss_fn, evasion_loss_fn, loss_weights, device
             )
         losses.append(float(loss))
-        row: dict[str, Any] = {"ID": sample["ID"]}
+        row: dict[str, Any] = {
+            "ID": sample["ID"],
+            "collision_context_source": collision_context_source,
+            "collision_context_index": collision_index,
+            "collision_context_frame": (
+                int(sample["frames"][collision_index])
+                if collision_index >= 0
+                else None
+            ),
+        }
         if sample["entry_index"] is not None:
             predicted_index = int(outputs["entry_logits"].argmax(dim=1).item())
             predicted_frame = int(sample["frames"][predicted_index])
@@ -266,7 +336,7 @@ def evaluate(
         "side_macro_f1": side_f1,
         "evasion_macro_f1": evasion_f1,
         "direct_score_normalized": direct_score,
-        "evasion_context": "annotated_collision_or_global_fallback",
+        "evasion_context": collision_context_source,
     }
     return metrics, predictions
 
@@ -287,6 +357,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--collision-window", type=int, default=2)
     parser.add_argument("--collision-jitter", type=int, default=4)
+    parser.add_argument(
+        "--collision-predictions",
+        type=Path,
+        default=None,
+        help="CSV containing ID and collision_pred_frame",
+    )
+    parser.add_argument(
+        "--ground-truth-context-probability",
+        type=float,
+        default=0.5,
+        help="For mixed training context, probability of using an available annotation",
+    )
     parser.add_argument("--entry-weight", type=float, default=1.0)
     parser.add_argument("--side-weight", type=float, default=0.5)
     parser.add_argument("--evasion-weight", type=float, default=0.5)
@@ -306,9 +388,16 @@ def main() -> None:
     args = parse_args()
     if args.collision_jitter < 0 or args.epochs < 1 or args.early_patience < 1:
         raise ValueError("collision-jitter must be nonnegative; epochs/patience must be positive")
+    if not 0 <= args.ground_truth_context_probability <= 1:
+        raise ValueError("ground-truth-context-probability must be between 0 and 1")
     labels_path = args.labels.expanduser().resolve()
     feature_dir = args.feature_dir.expanduser().resolve()
-    labels = _load_labels(labels_path)
+    collision_predictions_path = (
+        args.collision_predictions.expanduser().resolve()
+        if args.collision_predictions is not None
+        else None
+    )
+    labels = _load_labels(labels_path, collision_predictions_path)
     samples = [_load_sample(row, feature_dir) for row in labels.itertuples(index=False)]
     train_samples = [sample for sample in samples if sample["split"] == "train"]
     val_samples = [sample for sample in samples if sample["split"] == "val"]
@@ -327,6 +416,8 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     device = torch.device(args.device)
     amp = not args.no_amp and device.type == "cuda"
+    train_context_source = "mixed" if collision_predictions_path else "annotated"
+    val_context_source = "predicted" if collision_predictions_path else "annotated"
 
     model_config = {
         "input_channels": input_channels,
@@ -383,6 +474,12 @@ def main() -> None:
             ),
         },
         "collision_jitter": args.collision_jitter,
+        "collision_predictions": (
+            str(collision_predictions_path) if collision_predictions_path else None
+        ),
+        "train_collision_context": train_context_source,
+        "val_collision_context": val_context_source,
+        "ground_truth_context_probability": args.ground_truth_context_probability,
         "optimizer": {"name": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
         "scheduler": {"name": "ReduceLROnPlateau", "factor": 0.5, "patience": 2, "min_lr": 1e-6},
         "epochs": args.epochs,
@@ -401,6 +498,10 @@ def main() -> None:
     print(f"Train: {len(train_samples)} | Val: {len(val_samples)}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"Class weights: {experiment_config['class_weights']}")
+    print(
+        f"Collision context: train={train_context_source} | "
+        f"val={val_context_source} | window=±{args.collision_window}"
+    )
     print(f"Run: {run_dir}")
 
     best_score, best_loss, bad_epochs = -float("inf"), float("inf"), 0
@@ -413,7 +514,11 @@ def main() -> None:
             sample = train_samples[int(sample_index)]
             maps = sample["maps"].unsqueeze(0).to(device=device, dtype=torch.float32)
             collision_index = _context_index(
-                sample, jitter=args.collision_jitter, rng=rng
+                sample,
+                source=train_context_source,
+                jitter=args.collision_jitter,
+                rng=rng,
+                ground_truth_probability=args.ground_truth_context_probability,
             )
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
@@ -432,7 +537,7 @@ def main() -> None:
 
         metrics, predictions = evaluate(
             model, val_samples, entry_loss_fn, side_loss_fn, evasion_loss_fn,
-            loss_weights, device, amp,
+            loss_weights, device, amp, val_context_source,
         )
         scheduler.step(metrics["loss"])
         score = metrics["direct_score_normalized"]
@@ -447,6 +552,13 @@ def main() -> None:
                 "feature_config": feature_config,
                 "entry_loss_config": entry_loss_fn.config,
                 "task_loss_weights": loss_weights,
+                "collision_context_config": {
+                    "train": train_context_source,
+                    "validation": val_context_source,
+                    "ground_truth_probability": args.ground_truth_context_probability,
+                    "jitter": args.collision_jitter,
+                    "window": args.collision_window,
+                },
                 "label_mapping": {"entry_side": SIDE_TO_INDEX, "evasion_space": {"0": 0, "1": 1}},
                 "epoch": epoch,
                 "metrics": metrics,
@@ -483,10 +595,7 @@ def main() -> None:
     print(f"Best epoch: {best['epoch']}")
     print(f"Best metrics: {best['metrics']}")
     print(f"Checkpoint: {best_path}")
-    print(
-        "Caution: validation evasion uses the annotated collision frame when available "
-        "and global context otherwise; submission uses the collision model prediction."
-    )
+    print(f"Validation evasion collision context: {val_context_source}")
 
 
 if __name__ == "__main__":

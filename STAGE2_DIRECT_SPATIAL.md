@@ -114,3 +114,50 @@ val_predictions.csv
 `inference.py`는 체크포인트의 `feature_config`를 읽어 학습과 추론의 resize, ResNet
 layer, 정규화를 동일하게 적용한다. 제출 ZIP을 만들 때 `prepare_submit.py`의
 `--stage2-direct-checkpoint`에 이 실험의 `best_model.pt`를 전달한다.
+
+## 4. Collision 예측 문맥 V3
+
+테스트에서는 충돌 정답을 사용할 수 없으므로 기존 Collision BiGRU로 직접 라벨링
+영상 전체의 충돌 위치를 먼저 예측한다. 출력 CSV는 중간 저장되며 같은 명령으로
+중단 지점부터 재개할 수 있다.
+
+```bash
+!python predict_stage2_collision_context.py \
+  --labels "/content/drive/MyDrive/2026_Dacon/data/stage2/annotations/stage2_labels_unique_keep_split_seed42_v1.csv" \
+  --video-root "/content/stage2/stage2_labeled_unique_keep_v1/videos" \
+  --collision-checkpoint "/content/drive/MyDrive/2026_Dacon/sungmin/stage2/best.pt" \
+  --backbone "/content/drive/MyDrive/2026_Dacon/sungmin/stage2/resnet18-f37072fd.pth" \
+  --output "/content/drive/MyDrive/2026_Dacon/data/stage2/annotations/stage2_collision_predictions_v1.csv" \
+  --batch-size 128
+```
+
+완료 로그의 `Collision Accuracy@0.3s`는 충돌 라벨이 있는 직접 라벨 영상만으로
+계산한 도메인 전이 성능이다. 생성한 예측을 사용해 Direct V3를 학습한다.
+
+```bash
+!python train_stage2_direct.py \
+  --labels "/content/drive/MyDrive/2026_Dacon/data/stage2/annotations/stage2_labels_unique_keep_split_seed42_v1.csv" \
+  --feature-dir "/content/stage2_direct_layer3_v1" \
+  --collision-predictions "/content/drive/MyDrive/2026_Dacon/data/stage2/annotations/stage2_collision_predictions_v1.csv" \
+  --output-root "/content/drive/MyDrive/2026_Dacon/data/stage2/experiments/direct_spatial" \
+  --name "direct_layer3_collision_mixed_window5_v3" \
+  --entry-loss gaussian_ce \
+  --sigma-sec 0.1 \
+  --hidden-size 128 \
+  --num-layers 1 \
+  --collision-window 5 \
+  --collision-jitter 4 \
+  --ground-truth-context-probability 0.5 \
+  --epochs 50 \
+  --early-patience 7
+```
+
+V3 학습 문맥은 다음과 같다.
+
+```text
+train: 충돌 정답이 있으면 GT/예측을 50:50으로 선택, 없으면 예측 사용
+val:   모든 영상에서 Collision 모델의 예측 사용
+test:  모든 영상에서 Collision 모델의 예측 사용
+```
+
+`--class-balance`는 V2에서 종합 성능을 낮췄으므로 V3 명령에는 사용하지 않는다.

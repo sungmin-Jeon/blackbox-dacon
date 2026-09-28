@@ -1,14 +1,89 @@
 """Checks for Stage 2 Direct training behavior."""
 
+import tempfile
 import unittest
+from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 
-from src.stage2.direct_train import _combined_loss
+from src.stage2.direct_train import _combined_loss, _context_index, _load_labels
 
 
 class DirectTrainingTests(unittest.TestCase):
+    def test_collision_context_sources_and_mixture(self):
+        sample = {
+            "collision_index": 2,
+            "collision_pred_index": 7,
+            "maps": torch.zeros(10, 2, 2, 2),
+        }
+        self.assertEqual(
+            _context_index(sample, source="annotated", jitter=0, rng=None), 2
+        )
+        self.assertEqual(
+            _context_index(sample, source="predicted", jitter=0, rng=None), 7
+        )
+        self.assertEqual(
+            _context_index(
+                sample,
+                source="mixed",
+                jitter=0,
+                rng=np.random.default_rng(1),
+                ground_truth_probability=1.0,
+            ),
+            2,
+        )
+        self.assertEqual(
+            _context_index(
+                sample,
+                source="mixed",
+                jitter=0,
+                rng=np.random.default_rng(1),
+                ground_truth_probability=0.0,
+            ),
+            7,
+        )
+        sample["collision_index"] = None
+        self.assertEqual(
+            _context_index(
+                sample,
+                source="mixed",
+                jitter=0,
+                rng=np.random.default_rng(1),
+            ),
+            7,
+        )
+
+    def test_collision_predictions_are_merged_and_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            labels_path = root / "labels.csv"
+            predictions_path = root / "predictions.csv"
+            pd.DataFrame(
+                [
+                    {"ID": "train", "split": "train", "entry_side": "LEFT", "evasion_space": 0,
+                     "entry_frame": 2, "collision_frame": 3},
+                    {"ID": "val", "split": "val", "entry_side": "RIGHT", "evasion_space": 1,
+                     "entry_frame": 2, "collision_frame": np.nan},
+                ]
+            ).to_csv(labels_path, index=False)
+            pd.DataFrame(
+                [
+                    {"ID": "train", "collision_pred_frame": 4},
+                    {"ID": "val", "collision_pred_frame": 5},
+                ]
+            ).to_csv(predictions_path, index=False)
+            labels = _load_labels(labels_path, predictions_path)
+            self.assertEqual(labels["collision_pred_frame"].tolist(), [4, 5])
+
+            pd.DataFrame(
+                [{"ID": "train", "collision_pred_frame": 4}]
+            ).to_csv(predictions_path, index=False)
+            with self.assertRaises(ValueError):
+                _load_labels(labels_path, predictions_path)
+
     def test_single_sample_class_weight_is_not_cancelled(self):
         outputs = {
             "entry_logits": torch.zeros(1, 3),

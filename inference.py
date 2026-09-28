@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 from PIL import Image
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import ResNet18_Weights, resnet18
 from torchvision.models.video import mvit_v2_s
@@ -466,7 +467,7 @@ def predict_stage1(data_dir, model_dir):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: frozen ResNet18 + collision-only BiGRU V0
+# Stage 2: collision BiGRU + direct spatial-attention BiGRU
 # ---------------------------------------------------------------------------
 class _Stage2Frames(Dataset):
     def __init__(self, paths, transform) -> None:
@@ -479,6 +480,19 @@ class _Stage2Frames(Dataset):
     def __getitem__(self, index: int):
         with Image.open(self.paths[index]) as image:
             return self.transform(image.convert("RGB"))
+
+
+class _Stage2RawFrames(Dataset):
+    def __init__(self, paths) -> None:
+        self.paths = paths
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int):
+        with Image.open(self.paths[index]) as image:
+            rgb = np.asarray(image.convert("RGB")).copy()
+        return torch.from_numpy(rgb).permute(2, 0, 1)
 
 
 class _Stage2CollisionBiGRU(nn.Module):
@@ -506,9 +520,146 @@ class _Stage2CollisionBiGRU(nn.Module):
         return self.collision_head(self.dropout(hidden)).squeeze(-1)
 
 
+class _Stage2SpatialAttentionPool(nn.Module):
+    def __init__(
+        self,
+        input_channels: int = 256,
+        projection_size: int = 128,
+        output_size: int = 256,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.project = nn.Sequential(
+            nn.Conv2d(input_channels, projection_size, kernel_size=1),
+            nn.GELU(),
+        )
+        attention_channels = max(16, projection_size // 2)
+        self.attention = nn.Sequential(
+            nn.Conv2d(projection_size, attention_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(attention_channels, 1, kernel_size=1),
+        )
+        self.fuse = nn.Sequential(
+            nn.Linear(projection_size * 2, output_size),
+            nn.LayerNorm(output_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, maps: torch.Tensor):
+        batch, steps, channels, height, width = maps.shape
+        flat = maps.reshape(batch * steps, channels, height, width)
+        projected = self.project(flat)
+        weights = self.attention(projected).flatten(2).softmax(dim=-1)
+        local = torch.bmm(projected.flatten(2), weights.transpose(1, 2)).squeeze(-1)
+        global_scene = projected.mean(dim=(-2, -1))
+        vectors = self.fuse(torch.cat([local, global_scene], dim=-1))
+        return vectors.reshape(batch, steps, -1)
+
+
+class _Stage2DirectSpatial(nn.Module):
+    def __init__(
+        self,
+        input_channels: int = 256,
+        projection_size: int = 128,
+        temporal_input_size: int = 256,
+        hidden_size: int = 128,
+        num_layers: int = 1,
+        dropout: float = 0.3,
+        collision_window: int = 2,
+        entry_temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.collision_window = collision_window
+        self.entry_temperature = entry_temperature
+        self.spatial = _Stage2SpatialAttentionPool(
+            input_channels=input_channels,
+            projection_size=projection_size,
+            output_size=temporal_input_size,
+            dropout=dropout,
+        )
+        self.temporal = nn.GRU(
+            temporal_input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        dimension = hidden_size * 2
+        self.dropout = nn.Dropout(dropout)
+        self.entry_head = nn.Linear(dimension, 1)
+        self.side_head = nn.Sequential(
+            nn.Linear(dimension, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 2),
+        )
+        self.evasion_head = nn.Sequential(
+            nn.Linear(dimension * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 2),
+        )
+
+    def _collision_context(self, hidden: torch.Tensor, collision_indices: torch.Tensor):
+        batch, steps, _ = hidden.shape
+        indices = collision_indices.to(device=hidden.device, dtype=torch.long).reshape(-1)
+        if len(indices) != batch or (indices < -1).any() or (indices >= steps).any():
+            raise ValueError("collision_indices must contain an index or -1 per video")
+        contexts = []
+        for batch_index, center in enumerate(indices.tolist()):
+            if center == -1:
+                contexts.append(hidden[batch_index].mean(dim=0))
+            else:
+                start = max(0, center - self.collision_window)
+                end = min(steps, center + self.collision_window + 1)
+                contexts.append(hidden[batch_index, start:end].mean(dim=0))
+        return torch.stack(contexts)
+
+    def forward(self, maps: torch.Tensor, collision_indices: torch.Tensor):
+        vectors = self.spatial(maps)
+        hidden, _ = self.temporal(vectors)
+        hidden = self.dropout(hidden)
+        entry_logits = self.entry_head(hidden).squeeze(-1)
+        entry_weights = (entry_logits / self.entry_temperature).softmax(dim=1)
+        entry_context = torch.bmm(entry_weights.unsqueeze(1), hidden).squeeze(1)
+        side_logits = self.side_head(entry_context)
+        collision_context = self._collision_context(hidden, collision_indices)
+        evasion_logits = self.evasion_head(
+            torch.cat([collision_context, hidden.mean(dim=1)], dim=-1)
+        )
+        return entry_logits, side_logits, evasion_logits
+
+
 def _frame_number(path: Path) -> int:
     match = re.search(r"(\d+)$", path.stem)
     return int(match.group(1)) if match else 0
+
+
+def _stage2_resize_short_edge(images: torch.Tensor, short_edge: int):
+    height, width = images.shape[-2:]
+    scale = short_edge / min(height, width)
+    return F.interpolate(
+        images,
+        size=(max(1, round(height * scale)), max(1, round(width * scale))),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    )
+
+
+def _stage2_spatial_features(backbone: nn.Module, images: torch.Tensor, layer: str):
+    hidden = backbone.conv1(images)
+    hidden = backbone.bn1(hidden)
+    hidden = backbone.relu(hidden)
+    hidden = backbone.maxpool(hidden)
+    hidden = backbone.layer1(hidden)
+    hidden = backbone.layer2(hidden)
+    hidden = backbone.layer3(hidden)
+    if layer == "layer4":
+        hidden = backbone.layer4(hidden)
+    return hidden
 
 
 def predict_stage2(data_dir, model_dir):
@@ -534,6 +685,32 @@ def predict_stage2(data_dir, model_dir):
     collision_model.load_state_dict(checkpoint["model_state_dict"])
     collision_model.to(device).eval()
 
+    direct_checkpoint = torch.load(
+        model_dir / "direct.pt", map_location="cpu", weights_only=False
+    )
+    direct_model = _Stage2DirectSpatial(**direct_checkpoint["model_config"])
+    direct_model.load_state_dict(direct_checkpoint["model_state_dict"])
+    direct_model.to(device).eval()
+
+    feature_config = direct_checkpoint.get("feature_config", {})
+    direct_layer = feature_config.get("layer", "layer3")
+    if direct_layer not in {"layer3", "layer4"}:
+        raise ValueError(f"Unsupported Stage 2 spatial layer: {direct_layer}")
+    short_edge = int(feature_config.get("short_edge", 256))
+    if short_edge < 32 or feature_config.get("crop") is not None:
+        raise ValueError("Unsupported Stage 2 Direct spatial preprocessing")
+    expected_channels = 256 if direct_layer == "layer3" else 512
+    if int(direct_checkpoint["model_config"]["input_channels"]) != expected_channels:
+        raise ValueError("Stage 2 Direct checkpoint and feature layer do not match")
+    direct_mean = torch.tensor(
+        feature_config.get("mean", (0.485, 0.456, 0.406)),
+        device=device,
+    ).view(1, 3, 1, 1)
+    direct_std = torch.tensor(
+        feature_config.get("std", (0.229, 0.224, 0.225)),
+        device=device,
+    ).view(1, 3, 1, 1)
+
     folders = sorted(path for path in (Path(data_dir) / "images").iterdir() if path.is_dir())
     rows = []
     with torch.inference_mode():
@@ -554,19 +731,58 @@ def predict_stage2(data_dir, model_dir):
             sequence = torch.cat(features)[None].to(device)
             collision_logits = collision_model(sequence)
             collision_index = int(collision_logits.argmax(1).item())
+            del sequence, collision_logits, features
+
+            direct_loader = DataLoader(
+                _Stage2RawFrames(paths),
+                batch_size=64,
+                num_workers=6,
+                pin_memory=True,
+            )
+            spatial_maps = []
+            for uint8_images in direct_loader:
+                images = uint8_images.to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                ).div_(255)
+                images = _stage2_resize_short_edge(images, short_edge)
+                images = (images - direct_mean) / direct_std
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=device.type == "cuda",
+                ):
+                    maps = _stage2_spatial_features(backbone, images, direct_layer)
+                spatial_maps.append(maps.half().cpu())
+                del images, maps
+
+            direct_sequence = torch.cat(spatial_maps)[None].to(
+                device=device, dtype=torch.float32
+            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=device.type == "cuda",
+            ):
+                entry_logits, side_logits, evasion_logits = direct_model(
+                    direct_sequence,
+                    torch.tensor([collision_index], device=device),
+                )
+            entry_index = int(entry_logits.argmax(1).item())
+            entry_side = "RIGHT" if int(side_logits.argmax(1).item()) == 1 else "LEFT"
+            evasion_space = int(evasion_logits.argmax(1).item())
             frame_numbers = [_frame_number(path) for path in paths]
             rows.append(
                 {
                     "ID": folder.name,
                     "collision_frame": frame_numbers[collision_index],
-                    # Valid deterministic placeholders until the remaining heads are trained.
-                    "entry_frame": frame_numbers[0],
-                    "evasion_space": 0,
-                    "entry_side": "LEFT",
+                    "entry_frame": frame_numbers[entry_index],
+                    "evasion_space": evasion_space,
+                    "entry_side": entry_side,
                 }
             )
+            del direct_sequence, spatial_maps, entry_logits, side_logits, evasion_logits
 
-    del backbone, collision_model
+    del backbone, collision_model, direct_model
     torch.cuda.empty_cache()
     return pd.DataFrame(rows, columns=["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"])
 

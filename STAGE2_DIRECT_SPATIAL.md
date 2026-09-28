@@ -111,6 +111,6 @@ labels_split.csv
 val_predictions.csv
 ```
 
-`best_model.pt`가 만들어진 뒤에 `inference.py`와 `prepare_submit.py`에 Direct 분기를
-연결한다. 체크포인트의 `feature_config`를 사용해야 학습과 추론의 resize, ResNet layer,
-정규화가 정확히 일치한다.
+`inference.py`는 체크포인트의 `feature_config`를 읽어 학습과 추론의 resize, ResNet
+layer, 정규화를 동일하게 적용한다. 제출 ZIP을 만들 때 `prepare_submit.py`의
+`--stage2-direct-checkpoint`에 이 실험의 `best_model.pt`를 전달한다.

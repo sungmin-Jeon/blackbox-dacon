@@ -270,7 +270,7 @@ Build the submission archive:
   --output "/content/drive/MyDrive/blackbox-dacon/submit.zip"
 ```
 
-The builder requires the four baseline checkpoint files and checks that the ZIP
+The builder requires the five checkpoint files and checks that the ZIP
 contains `predict_stage1`, `predict_stage2`, and `predict_stage3`.
 
 When Stage checkpoints live in separate experiment folders, assemble them
@@ -280,6 +280,7 @@ without manually copying files:
 !python prepare_submit.py \
   --stage1-checkpoint "/path/to/stage1/baidu_baseline_v1/best.pt" \
   --stage2-checkpoint "/path/to/stage2/best.pt" \
+  --stage2-direct-checkpoint "/path/to/stage2/direct_spatial/best_model.pt" \
   --stage2-backbone "/path/to/stage2/resnet18-f37072fd.pth" \
   --stage3-checkpoint "/path/to/stage3/best.pt" \
   --output "/path/to/submissions/baidu_v1/submit_baidu_v1.zip"

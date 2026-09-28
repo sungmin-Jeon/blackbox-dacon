@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1-checkpoint", type=Path, required=True)
     parser.add_argument("--stage2-checkpoint", type=Path, required=True)
+    parser.add_argument("--stage2-direct-checkpoint", type=Path, required=True)
     parser.add_argument("--stage2-backbone", type=Path, required=True)
     parser.add_argument("--stage3-checkpoint", type=Path, required=True)
     parser.add_argument("--inference-file", type=Path, default=Path("inference.py"))
@@ -49,6 +50,10 @@ def main() -> None:
     model_sources = {
         "stage1/best.pt": _existing_file(args.stage1_checkpoint, "Stage 1 checkpoint"),
         "stage2/best.pt": _existing_file(args.stage2_checkpoint, "Stage 2 checkpoint"),
+        "stage2/direct.pt": _existing_file(
+            args.stage2_direct_checkpoint,
+            "Stage 2 Direct checkpoint",
+        ),
         "stage2/resnet18-f37072fd.pth": _existing_file(
             args.stage2_backbone,
             "Stage 2 backbone",

@@ -12,6 +12,7 @@ REQUIRED_FUNCTIONS = {"predict_stage1", "predict_stage2", "predict_stage3"}
 REQUIRED_MODELS = {
     "stage1/best.pt",
     "stage2/best.pt",
+    "stage2/direct.pt",
     "stage2/resnet18-f37072fd.pth",
     "stage3/best.pt",
 }

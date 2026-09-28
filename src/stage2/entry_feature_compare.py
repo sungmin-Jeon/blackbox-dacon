@@ -269,7 +269,7 @@ def train_one_feature(
         "hidden_size": args.hidden_size,
         "num_layers": args.num_layers,
         "dropout": args.dropout,
-        "delta_mode": "none",
+        "delta_mode": args.delta_mode,
     }
     model = CollisionFeatureModel(**model_config).to(device)
     loss_fn = make_temporal_loss("gaussian_ce", sigma_sec=args.sigma_sec)
@@ -319,7 +319,7 @@ def train_one_feature(
     print("=" * 88)
     print(
         f"Feature: {feature_name} | kind={feature_info['feature_kind']} | "
-        f"channels={feature_info['input_channels']} | delta=none"
+        f"channels={feature_info['input_channels']} | delta={args.delta_mode}"
     )
     print(
         f"Train: {len(train_samples)} | Val: {len(val_samples)} | "
@@ -467,6 +467,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument(
+        "--delta-mode",
+        choices=("none", "concat"),
+        default="none",
+        help="concat appends signed feature[t]-feature[t-1] along channels",
+    )
     parser.add_argument("--sigma-sec", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-patience", type=int, default=10)
@@ -509,7 +515,7 @@ def main() -> None:
         f"@0.3 {selected_prior_metrics['acc_03']:.1%} | "
         f"median {selected_prior_metrics['median_sec']:.3f}s"
     )
-    print(f"Features: {args.features} | Delta: disabled | Loss: gaussian_ce")
+    print(f"Features: {args.features} | Delta: {args.delta_mode} | Loss: gaussian_ce")
 
     output_root = args.output_root.expanduser().resolve()
     feature_root = args.feature_root.expanduser().resolve()

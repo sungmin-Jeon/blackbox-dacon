@@ -372,6 +372,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entry-weight", type=float, default=1.0)
     parser.add_argument("--side-weight", type=float, default=0.5)
     parser.add_argument("--evasion-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--selection-metric",
+        choices=("direct", "entry", "side", "evasion"),
+        default="direct",
+        help="metric used to select best_model.pt",
+    )
     parser.add_argument("--class-balance", action="store_true")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-patience", type=int, default=7)
@@ -444,8 +450,10 @@ def main() -> None:
     side_loss_fn = nn.CrossEntropyLoss(weight=side_weight, reduction="none")
     evasion_loss_fn = nn.CrossEntropyLoss(weight=evasion_weight, reduction="none")
     loss_weights = {"entry": args.entry_weight, "side": args.side_weight, "evasion": args.evasion_weight}
-    if any(weight <= 0 for weight in loss_weights.values()):
-        raise ValueError("All task loss weights must be positive")
+    if any(weight < 0 for weight in loss_weights.values()):
+        raise ValueError("Task loss weights cannot be negative")
+    if not any(weight > 0 for weight in loss_weights.values()):
+        raise ValueError("At least one task loss weight must be positive")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -464,6 +472,7 @@ def main() -> None:
         "model": model_config,
         "entry_loss": entry_loss_fn.config,
         "task_loss_weights": loss_weights,
+        "selection_metric": args.selection_metric,
         "class_balance": args.class_balance,
         "class_weights": {
             "side": side_weight.detach().cpu().tolist() if side_weight is not None else None,
@@ -540,7 +549,13 @@ def main() -> None:
             loss_weights, device, amp, val_context_source,
         )
         scheduler.step(metrics["loss"])
-        score = metrics["direct_score_normalized"]
+        score_names = {
+            "direct": "direct_score_normalized",
+            "entry": "entry_acc_03",
+            "side": "side_macro_f1",
+            "evasion": "evasion_macro_f1",
+        }
+        score = metrics[score_names[args.selection_metric]]
         improved = score > best_score + 1e-12 or (
             abs(score - best_score) <= 1e-12 and metrics["loss"] < best_loss - 1e-6
         )
@@ -552,6 +567,7 @@ def main() -> None:
                 "feature_config": feature_config,
                 "entry_loss_config": entry_loss_fn.config,
                 "task_loss_weights": loss_weights,
+                "selection_metric": args.selection_metric,
                 "collision_context_config": {
                     "train": train_context_source,
                     "validation": val_context_source,
@@ -585,7 +601,8 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | train {row['train_loss']:.4f} | val {metrics['loss']:.4f} | "
             f"entry@0.3 {metrics['entry_acc_03']:.1%} | side F1 {metrics['side_macro_f1']:.3f} | "
-            f"evasion F1 {metrics['evasion_macro_f1']:.3f} | direct {score:.3f} | {status}"
+            f"evasion F1 {metrics['evasion_macro_f1']:.3f} | "
+            f"selected {args.selection_metric} {score:.3f} | {status}"
         )
         if bad_epochs >= args.early_patience:
             print("Early stopping")

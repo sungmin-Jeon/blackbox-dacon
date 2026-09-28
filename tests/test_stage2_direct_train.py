@@ -119,6 +119,32 @@ class DirectTrainingTests(unittest.TestCase):
         )
         torch.testing.assert_close(weighted, unweighted * 3)
 
+    def test_zero_weight_tasks_are_excluded_from_total(self):
+        outputs = {
+            "entry_logits": torch.zeros(1, 3),
+            "side_logits": torch.zeros(1, 2),
+            "evasion_logits": torch.tensor([[0.2, -0.3]]),
+        }
+        sample = {
+            "ID": "sample",
+            "entry_index": None,
+            "side": 1,
+            "evasion": 0,
+        }
+        total, terms = _combined_loss(
+            outputs,
+            sample,
+            nn.Identity(),
+            nn.CrossEntropyLoss(reduction="none"),
+            nn.CrossEntropyLoss(reduction="none"),
+            {"entry": 0.0, "side": 0.0, "evasion": 1.0},
+            torch.device("cpu"),
+        )
+        expected = nn.CrossEntropyLoss()(outputs["evasion_logits"], torch.tensor([0]))
+        torch.testing.assert_close(total, expected)
+        self.assertIn("side", terms)
+        self.assertIn("evasion", terms)
+
 
 if __name__ == "__main__":
     unittest.main()
